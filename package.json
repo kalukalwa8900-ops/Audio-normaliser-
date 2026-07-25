@@ -1,0 +1,20 @@
+{
+  "name": "voice-batch-studio-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js && node --check src/ffmpeg.js && node --check src/pipeline.js && node --check src/jobs.js && node --check src/files.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.0",
+    "@fastify/multipart": "^9.0.0",
+    "archiver": "^7.0.1",
+    "fastify": "^5.0.0",
+    "p-limit": "^6.2.0",
+    "sanitize-filename": "^1.6.3",
+    "unzipper": "^0.12.3"
+  }
+}
