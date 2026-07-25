@@ -27,15 +27,17 @@ export function createJob(base = {}) {
 
 export function getJob(id) { return jobs.get(id); }
 
-export function publicJob(job) {
+export function publicJob(job, { includeFiles = true } = {}) {
   if (!job) return null;
-  const { emitter, inputDir, outputDir, workDir, inputZip, outputZip, reportPath, ...safe } = job;
-  return safe;
+  const { emitter, inputDir, outputDir, workDir, inputZip, outputZip, reportPath, files, ...safe } = job;
+  return includeFiles ? { ...safe, files } : { ...safe, fileCount: files?.length || 0 };
 }
+
 
 export function updateJob(job, patch, event = 'progress') {
   Object.assign(job, patch, { updatedAt: new Date().toISOString() });
-  const payload = publicJob(job);
+  const includeFiles = ['analyzed', 'completed', 'failed'].includes(event);
+  const payload = publicJob(job, { includeFiles });
   job.emitter.emit(event, payload);
   job.emitter.emit('message', { event, data: payload });
   return job;

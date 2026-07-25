@@ -104,13 +104,16 @@ app.get('/jobs/:id/events', async (request, reply) => {
   if (!job) return reply.code(404).send({ error: 'Job not found or expired' });
   reply.hijack();
   const res = reply.raw;
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-  const send = ({ event = 'message', data }) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.flushHeaders?.();
+  const send = ({ event = 'message', data }) => { if (!res.destroyed && !res.writableEnded) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); };
   send({ event: 'snapshot', data: publicJob(job) });
   const listener = (message) => send(message);
   job.emitter.on('message', listener);
-  const heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15_000);
-  request.raw.on('close', () => { clearInterval(heartbeat); job.emitter.off('message', listener); res.end(); });
+  const heartbeat = setInterval(() => { if (!res.destroyed && !res.writableEnded) res.write(': keep-alive\n\n'); }, 15_000);
+  const cleanup = () => { clearInterval(heartbeat); job.emitter.off('message', listener); if (!res.writableEnded) res.end(); };
+  request.raw.once('close', cleanup);
+  request.raw.once('error', cleanup);
 });
 
 app.get('/jobs/:id/download', async (request, reply) => {
