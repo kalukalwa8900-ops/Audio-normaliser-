@@ -11,7 +11,6 @@ import archiver from "archiver";
 import { createJob, getJob, jobs, WORK_ROOT } from "./jobs.js";
 import { analyzeMp3, ffmpegVersion } from "./ffmpeg.js";
 import { runJob } from "./pipeline.js";
-import { FFMPEG_WORKERS, detectedCpuCount } from "./concurrency.js";
 
 const execFileP = promisify(execFile);
 
@@ -47,7 +46,7 @@ app.get("/health", async () => {
   try {
     ff = await ffmpegVersion();
   } catch {}
-  return { version: "1.1.0", ffmpeg: ff, cpuCount: detectedCpuCount(), ffmpegWorkers: FFMPEG_WORKERS };
+  return { version: "1.0.0", ffmpeg: ff };
 });
 
 // ---- Analyze one file ----

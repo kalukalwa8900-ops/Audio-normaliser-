@@ -20,8 +20,6 @@ export function createJob({ id, dir, inDir, outDir, settings, files, fileMap }) 
     overallPct: 0,
     completed: 0,
     failed: 0,
-    processing: 0,
-    currentlyProcessing: [],
     total: files.filter((f) => !f.excluded).length,
   };
   job.fileResults = [];        // [{ id, result }]

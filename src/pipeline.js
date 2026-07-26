@@ -2,7 +2,6 @@ import { promises as fs, createWriteStream } from "node:fs";
 import path from "node:path";
 import archiver from "archiver";
 import { runFfmpeg, parseLoudnormJson, analyzeMp3 } from "./ffmpeg.js";
-import { FFMPEG_WORKERS, ffmpegFileLimit } from "./concurrency.js";
 
 const PRESET_CHAINS = {
   original: [],
@@ -109,6 +108,18 @@ function buildProcessingFilters(settings, overrides) {
   return chain;
 }
 
+async function measureLoudness(inPath, targetLufs, tp, lra) {
+  const { stderr } = await runFfmpeg([
+    "-hide_banner",
+    "-i", inPath,
+    "-af",
+    `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:print_format=json`,
+    "-f", "null",
+    "-",
+  ]);
+  return parseLoudnormJson(stderr);
+}
+
 async function processFile({ job, file, log }) {
   const settings = job.settings;
   const overrides = file.overrides ?? {};
@@ -124,20 +135,47 @@ async function processFile({ job, file, log }) {
 
   const preFilters = buildProcessingFilters(settings, overrides);
 
-  // OPTIMIZATION: Single-pass processing instead of 3 separate FFmpeg invocations
-  // Old pipeline: Stage (encode to WAV) → Measure loudness → Apply normalized loudness + limiter
-  // New pipeline: Apply all + loudnorm + limiter directly in one pass
-  
+  // Intermediate WAV so loudnorm two-pass can measure post-enhancement audio.
+  const stageDir = path.join(job.dir, `stage_${file.id}`);
+  await fs.mkdir(stageDir, { recursive: true });
+  const stagedWav = path.join(stageDir, "staged.wav");
+
+  const stageArgs = [
+    "-hide_banner", "-y",
+    "-i", inPath,
+  ];
+  if (preFilters.length > 0) {
+    stageArgs.push("-af", preFilters.join(","));
+  }
+  stageArgs.push("-ar", "48000", "-ac", "2", stagedWav);
+  await runFfmpeg(stageArgs);
+
+  // Pass 1: measure
+  const measured = await measureLoudness(stagedWav, targetLufs, tp, lra);
+  const limiterCeiling = tp;
+
+  // Pass 2: apply
   const outRel = file.folder
     ? path.join(file.folder, file.name)
     : file.name;
   const outAbs = path.join(job.outDir, outRel);
   await fs.mkdir(path.dirname(outAbs), { recursive: true });
 
-  // Build complete filter chain: enhancements → loudnorm → limiter
-  const allFilters = [...preFilters];
-  allFilters.push(`loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:print_format=json`);
-  allFilters.push(`alimiter=limit=${tp}dB`);
+  const applyFilters = [];
+  if (measured) {
+    applyFilters.push(
+      `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}` +
+        `:measured_I=${measured.input_i}` +
+        `:measured_LRA=${measured.input_lra}` +
+        `:measured_TP=${measured.input_tp}` +
+        `:measured_thresh=${measured.input_thresh}` +
+        `:offset=${measured.target_offset}` +
+        `:linear=true:print_format=summary`,
+    );
+  } else {
+    applyFilters.push(`loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}`);
+  }
+  applyFilters.push(`alimiter=limit=${limiterCeiling}dB`);
 
   const bitrate = settings.outputBitrate && settings.outputBitrate !== "preserve"
     ? `${settings.outputBitrate / 1000}k`
@@ -151,20 +189,19 @@ async function processFile({ job, file, log }) {
     settings.outputChannels === "mono" ? "1" :
     settings.outputChannels === "stereo" ? "2" : String(originalAnalysis?.channels ?? 2);
 
-  // Single FFmpeg call: input → filters → loudnorm → limiter → MP3 encode
-  const encodeArgs = [
+  const applyArgs = [
     "-hide_banner", "-y",
-    "-i", inPath,
-    "-af", allFilters.join(","),
+    "-i", stagedWav,
+    "-af", applyFilters.join(","),
     "-ar", sr,
     "-ac", channels,
     "-c:a", "libmp3lame",
     "-b:a", bitrate,
     outAbs,
   ];
-  await runFfmpeg(encodeArgs);
+  await runFfmpeg(applyArgs);
 
-  // Verify output loudness with single analysis
+  // Verify
   let finalAnalysis = null;
   let verificationPassed = true;
   if (settings.verifyOutput !== false) {
@@ -174,19 +211,18 @@ async function processFile({ job, file, log }) {
       finalAnalysis?.lufs != null &&
       Math.abs(finalAnalysis.lufs - targetLufs) > tol
     ) {
-      // If verification fails, retry with dynamic loudnorm (second pass only)
+      // Retry with dynamic loudnorm
       log.warn?.(
         { id: file.id, measured: finalAnalysis.lufs, target: targetLufs },
-        "verification miss — retrying with dynamic loudnorm",
+        "verification miss — retrying with linear=false",
       );
       const retryFilters = [
-        ...preFilters,
         `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:linear=false:print_format=summary`,
-        `alimiter=limit=${tp}dB`,
+        `alimiter=limit=${limiterCeiling}dB`,
       ];
       await runFfmpeg([
         "-hide_banner", "-y",
-        "-i", inPath,
+        "-i", stagedWav,
         "-af", retryFilters.join(","),
         "-ar", sr,
         "-ac", channels,
@@ -200,6 +236,8 @@ async function processFile({ job, file, log }) {
         Math.abs(finalAnalysis.lufs - targetLufs) <= tol * 1.5;
     }
   }
+
+  await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
 
   const outStat = await fs.stat(outAbs).catch(() => null);
   return {
@@ -271,57 +309,28 @@ export async function runJob(job, log) {
     job.emit("progress", job.progress);
   };
 
-  emitProgress({
-    stage: "processing",
-    overallPct: 0,
-    completed: 0,
-    failed: 0,
-    processing: 0,
-    currentlyProcessing: [],
-    total,
-    workerCount: FFMPEG_WORKERS,
-  });
+  emitProgress({ stage: "processing", overallPct: 0, completed: 0, failed: 0, total });
 
-  const reportRows = new Array(total);
-  const failedByIndex = new Array(total);
+  const reportRows = [];
+  const failed = [];
   let completed = 0;
   let failCount = 0;
-  let nextIndex = 0;
-  const active = new Map();
-  const startedAt = Date.now();
 
-  const updateProgress = () => {
-    const finished = completed + failCount;
-    const elapsedMs = Date.now() - startedAt;
-    const rate = finished > 0 ? finished / Math.max(1, elapsedMs) : 0;
-    const remaining = total - finished;
-    const etaSeconds = rate > 0 ? Math.ceil(remaining / rate / 1000) : null;
+  for (const file of included) {
+    if (job.cancelled) {
+      emitProgress({ stage: "failed", message: "cancelled" });
+      return;
+    }
     emitProgress({
       stage: "processing",
-      completed,
-      failed: failCount,
-      processing: active.size,
-      currentlyProcessing: [...active.values()],
-      current: [...active.values()][0],
-      overallPct: total === 0 ? 100 : Math.round((finished / total) * 100),
-      etaSeconds,
+      current: file.folder ? `${file.folder}/${file.name}` : file.name,
     });
-  };
-
-  async function processIndex(index) {
-    const file = included[index];
-    const displayName = file.folder ? `${file.folder}/${file.name}` : file.name;
-    active.set(file.id, displayName);
-    updateProgress();
-
     try {
-      const { originalAnalysis, finalAnalysis, result } = await ffmpegFileLimit.run(() =>
-        processFile({ job, file, log }),
-      );
+      const { originalAnalysis, finalAnalysis, result } = await processFile({ job, file, log });
       completed++;
       job.fileResults.push({ id: file.id, result });
       job.emit("file", { id: file.id, result });
-      reportRows[index] = [
+      reportRows.push([
         file.sequence,
         file.name,
         file.folder ?? "",
@@ -340,53 +349,33 @@ export async function runJob(job, log) {
         finalAnalysis?.bitrate ?? "",
         result.verificationPassed ? "ok" : "verification_miss",
         "",
-      ];
+      ]);
     } catch (err) {
       failCount++;
       const msg = err.message ?? String(err);
       log.error?.({ err, file: file.name }, "file failed");
-      failedByIndex[index] = { name: file.name, error: msg };
-      const result = { error: msg, verificationPassed: false };
-      job.fileResults.push({ id: file.id, result });
-      job.emit("file", { id: file.id, result });
-      reportRows[index] = [
+      failed.push({ name: file.name, error: msg });
+      job.fileResults.push({ id: file.id, result: { error: msg, verificationPassed: false } });
+      job.emit("file", { id: file.id, result: { error: msg, verificationPassed: false } });
+      reportRows.push([
         file.sequence, file.name, file.folder ?? "",
         "", "", "", "", "", "", "",
         file.overrides?.speed ?? job.settings.speed ?? 1,
         file.overrides?.preset ?? job.settings.preset ?? "original",
         "", "", "", "", "failed", msg,
-      ];
-    } finally {
-      active.delete(file.id);
-      updateProgress();
+      ]);
     }
-  }
-
-  async function workerLoop() {
-    while (!job.cancelled) {
-      const index = nextIndex++;
-      if (index >= total) return;
-      await processIndex(index);
-    }
-  }
-
-  const localWorkerCount = Math.min(FFMPEG_WORKERS, Math.max(1, total));
-  await Promise.all(Array.from({ length: localWorkerCount }, () => workerLoop()));
-
-  if (job.cancelled) {
     emitProgress({
-      stage: "failed",
-      message: "cancelled",
-      processing: 0,
-      currentlyProcessing: [],
+      completed,
+      failed: failCount,
+      overallPct: Math.round(((completed + failCount) / total) * 100),
     });
-    return;
   }
 
-  emitProgress({ stage: "packaging", overallPct: 100, processing: 0, currentlyProcessing: [] });
-  await writeReport(job, reportRows.filter(Boolean));
-  await packageZip(job, failedByIndex.filter(Boolean));
-  emitProgress({ stage: "ready", overallPct: 100, etaSeconds: 0 });
+  emitProgress({ stage: "packaging", overallPct: 100 });
+  await writeReport(job, reportRows);
+  await packageZip(job, failed);
+  emitProgress({ stage: "ready", overallPct: 100 });
   job.done = true;
   job.emit("done");
 }
