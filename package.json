@@ -1,12 +1,13 @@
 {
   "name": "voice-batch-studio-backend",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "FFmpeg-powered backend for Voice Batch Studio",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/server.js && node --check src/pipeline.js && node --check src/ffmpeg.js && node --check src/concurrency.js"
   },
   "engines": {
     "node": ">=20"
