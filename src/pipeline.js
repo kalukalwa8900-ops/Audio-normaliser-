@@ -2,6 +2,7 @@ import { promises as fs, createWriteStream } from "node:fs";
 import path from "node:path";
 import archiver from "archiver";
 import { runFfmpeg, parseLoudnormJson, analyzeMp3 } from "./ffmpeg.js";
+import { FFMPEG_WORKERS, ffmpegFileLimit } from "./concurrency.js";
 
 const PRESET_CHAINS = {
   original: [],
@@ -309,28 +310,57 @@ export async function runJob(job, log) {
     job.emit("progress", job.progress);
   };
 
-  emitProgress({ stage: "processing", overallPct: 0, completed: 0, failed: 0, total });
+  emitProgress({
+    stage: "processing",
+    overallPct: 0,
+    completed: 0,
+    failed: 0,
+    processing: 0,
+    currentlyProcessing: [],
+    total,
+    workerCount: FFMPEG_WORKERS,
+  });
 
-  const reportRows = [];
-  const failed = [];
+  const reportRows = new Array(total);
+  const failedByIndex = new Array(total);
   let completed = 0;
   let failCount = 0;
+  let nextIndex = 0;
+  const active = new Map();
+  const startedAt = Date.now();
 
-  for (const file of included) {
-    if (job.cancelled) {
-      emitProgress({ stage: "failed", message: "cancelled" });
-      return;
-    }
+  const updateProgress = () => {
+    const finished = completed + failCount;
+    const elapsedMs = Date.now() - startedAt;
+    const rate = finished > 0 ? finished / Math.max(1, elapsedMs) : 0;
+    const remaining = total - finished;
+    const etaSeconds = rate > 0 ? Math.ceil(remaining / rate / 1000) : null;
     emitProgress({
       stage: "processing",
-      current: file.folder ? `${file.folder}/${file.name}` : file.name,
+      completed,
+      failed: failCount,
+      processing: active.size,
+      currentlyProcessing: [...active.values()],
+      current: [...active.values()][0],
+      overallPct: total === 0 ? 100 : Math.round((finished / total) * 100),
+      etaSeconds,
     });
+  };
+
+  async function processIndex(index) {
+    const file = included[index];
+    const displayName = file.folder ? `${file.folder}/${file.name}` : file.name;
+    active.set(file.id, displayName);
+    updateProgress();
+
     try {
-      const { originalAnalysis, finalAnalysis, result } = await processFile({ job, file, log });
+      const { originalAnalysis, finalAnalysis, result } = await ffmpegFileLimit.run(() =>
+        processFile({ job, file, log }),
+      );
       completed++;
       job.fileResults.push({ id: file.id, result });
       job.emit("file", { id: file.id, result });
-      reportRows.push([
+      reportRows[index] = [
         file.sequence,
         file.name,
         file.folder ?? "",
@@ -349,33 +379,54 @@ export async function runJob(job, log) {
         finalAnalysis?.bitrate ?? "",
         result.verificationPassed ? "ok" : "verification_miss",
         "",
-      ]);
+      ];
     } catch (err) {
       failCount++;
       const msg = err.message ?? String(err);
       log.error?.({ err, file: file.name }, "file failed");
-      failed.push({ name: file.name, error: msg });
-      job.fileResults.push({ id: file.id, result: { error: msg, verificationPassed: false } });
-      job.emit("file", { id: file.id, result: { error: msg, verificationPassed: false } });
-      reportRows.push([
+      failedByIndex[index] = { name: file.name, error: msg };
+      const result = { error: msg, verificationPassed: false };
+      job.fileResults.push({ id: file.id, result });
+      job.emit("file", { id: file.id, result });
+      reportRows[index] = [
         file.sequence, file.name, file.folder ?? "",
         "", "", "", "", "", "", "",
         file.overrides?.speed ?? job.settings.speed ?? 1,
         file.overrides?.preset ?? job.settings.preset ?? "original",
         "", "", "", "", "failed", msg,
-      ]);
+      ];
+    } finally {
+      await fs.rm(path.join(job.dir, `stage_${file.id}`), { recursive: true, force: true }).catch(() => {});
+      active.delete(file.id);
+      updateProgress();
     }
-    emitProgress({
-      completed,
-      failed: failCount,
-      overallPct: Math.round(((completed + failCount) / total) * 100),
-    });
   }
 
-  emitProgress({ stage: "packaging", overallPct: 100 });
-  await writeReport(job, reportRows);
-  await packageZip(job, failed);
-  emitProgress({ stage: "ready", overallPct: 100 });
+  async function workerLoop() {
+    while (!job.cancelled) {
+      const index = nextIndex++;
+      if (index >= total) return;
+      await processIndex(index);
+    }
+  }
+
+  const localWorkerCount = Math.min(FFMPEG_WORKERS, Math.max(1, total));
+  await Promise.all(Array.from({ length: localWorkerCount }, () => workerLoop()));
+
+  if (job.cancelled) {
+    emitProgress({
+      stage: "failed",
+      message: "cancelled",
+      processing: 0,
+      currentlyProcessing: [],
+    });
+    return;
+  }
+
+  emitProgress({ stage: "packaging", overallPct: 100, processing: 0, currentlyProcessing: [] });
+  await writeReport(job, reportRows.filter(Boolean));
+  await packageZip(job, failedByIndex.filter(Boolean));
+  emitProgress({ stage: "ready", overallPct: 100, etaSeconds: 0 });
   job.done = true;
   job.emit("done");
 }

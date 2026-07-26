@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { promises as fs } from "node:fs";
 
 const execFileP = promisify(execFile);
+const MAX_CAPTURE_BYTES = Number(process.env.FFMPEG_LOG_CAPTURE_BYTES ?? 2 * 1024 * 1024);
 
 export async function ffmpegVersion() {
   const { stdout } = await execFileP("ffmpeg", ["-version"]);
@@ -17,38 +18,51 @@ export async function ffprobeJson(input) {
     "-show_streams",
     "-of", "json",
     input,
-  ]);
+  ], { maxBuffer: MAX_CAPTURE_BYTES });
   return JSON.parse(stdout);
 }
 
+function appendBounded(current, chunk, maxBytes) {
+  const next = current + chunk.toString();
+  if (Buffer.byteLength(next) <= maxBytes) return next;
+  return next.slice(-maxBytes);
+}
+
 /**
- * Runs ffmpeg with args, returns { stdout, stderr, code }.
- * Uses spawn so we can capture stderr even on failure.
+ * Runs one FFmpeg child process asynchronously.
+ * Output capture is bounded so a malformed/noisy file cannot grow memory forever.
  */
-export function runFfmpeg(args) {
+export function runFfmpeg(args, { signal } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn("ffmpeg", args);
+    const child = spawn("ffmpeg", ["-nostdin", ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+      signal,
+    });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (d) => (stdout += d.toString()));
-    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.stdout.on("data", (d) => {
+      stdout = appendBounded(stdout, d, MAX_CAPTURE_BYTES);
+    });
+    child.stderr.on("data", (d) => {
+      stderr = appendBounded(stderr, d, MAX_CAPTURE_BYTES);
+    });
     child.on("error", reject);
-    child.on("close", (code) => {
+    child.on("close", (code, childSignal) => {
       if (code === 0) resolve({ stdout, stderr, code });
-      else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-800)}`));
+      else {
+        const suffix = childSignal ? ` (signal ${childSignal})` : "";
+        reject(new Error(`ffmpeg exited ${code}${suffix}: ${stderr.slice(-1200)}`));
+      }
     });
   });
 }
 
-/**
- * Extract loudnorm JSON block from ffmpeg stderr.
- */
+/** Extract loudnorm JSON block from FFmpeg stderr. */
 export function parseLoudnormJson(stderr) {
-  // ffmpeg prints the JSON near the end
-  const m = stderr.match(/\{[^{}]*"input_i"[\s\S]*?\}/);
-  if (!m) return null;
+  const matches = stderr.match(/\{[^{}]*"input_i"[\s\S]*?\}/g);
+  if (!matches?.length) return null;
   try {
-    return JSON.parse(m[0]);
+    return JSON.parse(matches[matches.length - 1]);
   } catch {
     return null;
   }
@@ -65,8 +79,36 @@ function classify(lufs, clipping) {
 }
 
 /**
- * Full single-file analysis.
+ * Measures loudness and volume in one FFmpeg decode by splitting the audio.
+ * This replaces two independent full-file FFmpeg executions without changing
+ * either filter's calculation.
  */
+async function measureAudio(input, targetLufs = -16, lraTarget = 7, truePeakTarget = -1.5) {
+  const filter =
+    `[0:a]asplit=2[loud][volume];` +
+    `[loud]loudnorm=I=${targetLufs}:LRA=${lraTarget}:TP=${truePeakTarget}:print_format=json[loudout];` +
+    `[volume]volumedetect[volumeout]`;
+  const { stderr } = await runFfmpeg([
+    "-hide_banner",
+    "-i", input,
+    "-filter_complex", filter,
+    "-map", "[loudout]", "-f", "null", "-",
+    "-map", "[volumeout]", "-f", "null", "-",
+  ]);
+
+  const loudness = parseLoudnormJson(stderr);
+  const maxPeakMatch = stderr.match(/max_volume:\s*(-?\d+(?:\.\d+)?)/);
+  const rmsMatch = stderr.match(/mean_volume:\s*(-?\d+(?:\.\d+)?)/);
+  return {
+    lufs: loudness ? Number(loudness.input_i) : undefined,
+    lra: loudness ? Number(loudness.input_lra) : undefined,
+    truePeak: loudness ? Number(loudness.input_tp) : undefined,
+    maxPeak: maxPeakMatch ? Number(maxPeakMatch[1]) : undefined,
+    rms: rmsMatch ? Number(rmsMatch[1]) : undefined,
+  };
+}
+
+/** Full single-file analysis. */
 export async function analyzeMp3(inPath) {
   const stat = await fs.stat(inPath);
   let probe;
@@ -90,41 +132,14 @@ export async function analyzeMp3(inPath) {
   const channels = Number(stream.channels ?? 0) || undefined;
   const codec = stream.codec_name ?? undefined;
 
-  // Loudness measurement + volumedetect for peak
-  let lufs, lra, truePeak;
+  let measurements = {};
   try {
-    const { stderr } = await runFfmpeg([
-      "-hide_banner",
-      "-i", inPath,
-      "-af", "loudnorm=I=-16:LRA=7:TP=-1.5:print_format=json",
-      "-f", "null",
-      "-",
-    ]);
-    const j = parseLoudnormJson(stderr);
-    if (j) {
-      lufs = Number(j.input_i);
-      lra = Number(j.input_lra);
-      truePeak = Number(j.input_tp);
-    }
-  } catch (err) {
-    // continue
+    measurements = await measureAudio(inPath);
+  } catch {
+    // Preserve prior behavior: metadata is still returned if measurement fails.
   }
 
-  let maxPeak, rms;
-  try {
-    const { stderr } = await runFfmpeg([
-      "-hide_banner",
-      "-i", inPath,
-      "-af", "volumedetect",
-      "-f", "null",
-      "-",
-    ]);
-    const mp = stderr.match(/max_volume:\s*(-?\d+(?:\.\d+)?)/);
-    const rm = stderr.match(/mean_volume:\s*(-?\d+(?:\.\d+)?)/);
-    if (mp) maxPeak = Number(mp[1]);
-    if (rm) rms = Number(rm[1]);
-  } catch {}
-
+  const { lufs, lra, truePeak, maxPeak, rms } = measurements;
   const clipping = (truePeak ?? -Infinity) > 0 || (maxPeak ?? -Infinity) >= 0;
   const warnings = [];
   if (clipping) warnings.push("True peak exceeds 0 dBTP");
