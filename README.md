@@ -1,62 +1,83 @@
-# Voice Batch Studio Backend
+# Voice Batch Studio — Backend
 
-Native FFmpeg backend for ZIP batches of MP3 narration files. It analyzes LUFS/true peak, supports presets and speed changes, applies two-pass loudness normalization, verifies outputs, preserves ZIP paths and filenames, and creates a downloadable ZIP plus CSV report.
+Node.js + Fastify backend that implements the HTTP contract in
+[`../BACKEND_API.md`](../BACKEND_API.md). Uses real `ffmpeg` / `ffprobe`
+for MP3 analysis and batch processing (two-pass loudnorm, voice enhancement
+presets, speed control, limiter, MP3 re-encode).
 
-## Railway deployment
+## Endpoints
 
-1. Upload the `backend` folder to a GitHub repository.
-2. Railway → **New Project** → **Deploy from GitHub**.
-3. Set the service **Root Directory** to `/backend` if this folder is inside a larger Lovable repository.
-4. Railway uses the included Dockerfile and installs native FFmpeg.
-5. Generate a public domain under **Settings → Networking**.
-6. Set `CORS_ORIGIN` to your Lovable URL, for example:
-   `https://your-app.lovable.app,https://yourdomain.com`
-7. Test `https://YOUR-RAILWAY-DOMAIN/health`.
+| Method | Path                    | Purpose                                |
+|--------|-------------------------|----------------------------------------|
+| GET    | `/health`               | Readiness probe (returns ffmpeg version) |
+| POST   | `/analyze`              | Analyze one MP3, returns metrics       |
+| POST   | `/jobs`                 | Create a batch processing job          |
+| GET    | `/jobs/:id/events`      | SSE stream of progress + per-file done |
+| GET    | `/jobs/:id/download`    | Final ZIP of processed files           |
+| GET    | `/jobs/:id/report.csv`  | CSV analysis/verification report       |
+| POST   | `/jobs/:id/cancel`      | Cancel an in-flight job                |
 
-## Environment variables
+## Local run
 
-- `CORS_ORIGIN=*` during initial testing; restrict it in production.
-- `MAX_UPLOAD_MB=2048`
-- `JOB_RETENTION_MINUTES=60`
-- `PROCESS_CONCURRENCY=2` (start with 1–2 on a small Railway instance)
-- `JOB_ROOT=/tmp/voice-batch-jobs`
+Requires Node 20+ and `ffmpeg` on PATH.
 
-## API
-
-### `POST /analyze`
-Multipart form-data with one field containing a `.zip`. Returns `202 { jobId }`. Poll `GET /jobs/:id` or open SSE.
-
-### `POST /jobs/:id/process`
-JSON body example:
-```json
-{
-  "targetLufs": -16,
-  "lra": 7,
-  "truePeak": -1.5,
-  "speed": 1.15,
-  "preset": "clear_narration",
-  "bitrateKbps": 192,
-  "toleranceLu": 0.5
-}
+```bash
+cd backend
+npm install
+npm start           # listens on http://localhost:8080
 ```
 
-### `POST /jobs`
-Upload and immediately analyze/process. Settings can be supplied as query parameters.
+Health check:
+```bash
+curl http://localhost:8080/health
+```
 
-### Other endpoints
-- `GET /health`
-- `GET /jobs/:id`
-- `GET /jobs/:id/events` (SSE)
-- `GET /jobs/:id/download`
-- `GET /jobs/:id/report.csv`
-- `POST /jobs/:id/cancel`
+Then in the Voice Batch Studio frontend, click the top-right badge, paste
+`http://localhost:8080`, uncheck **Demo mode**, **Test connection**.
 
-## Presets
+## Deploy to Railway
 
-`original`, `voice_focus`, `clear_narration`, `sweet_voice`, `deep_narration`, `bright_voice`, `podcast_voice`, `noisy_repair`.
+1. Push this `backend/` folder to a GitHub repo (or the whole project — set
+   Railway's **Root Directory** to `backend`).
+2. On Railway: **New Project → Deploy from GitHub repo** → pick the repo.
+3. Railway auto-detects the `Dockerfile` (ffmpeg gets installed inside the
+   image, so no extra buildpack config is needed).
+4. Set environment variables (optional):
+   - `CORS_ORIGIN` — comma-separated list of allowed origins.
+     Default `*` (fine while testing). Set to your Lovable preview URL and
+     your custom domain for production, e.g.
+     `https://id-preview--xxxxx.lovable.app,https://your-domain.com`.
+   - `MAX_UPLOAD_MB` — per-request cap (default `4096`).
+   - `JOB_TTL_SECONDS` — how long finished jobs stay downloadable
+     (default `3600`).
+5. Add a **Volume** mounted at `/app/work` if you want jobs to survive
+   restarts (optional; scratch data is regenerated per job anyway).
+6. Once deployed, Railway gives you a public URL like
+   `https://voice-batch-studio-production.up.railway.app` — paste that into
+   the Voice Batch Studio badge as the backend URL.
 
-## Important production notes
+## Deploy to any Docker host (Fly.io, Render, VPS)
 
-This starter stores jobs in memory and temporary local disk. A Railway restart loses job metadata and ephemeral files. For serious production use, add object storage (Supabase Storage/R2/S3) and Redis/Postgres-backed jobs. Start with small test ZIPs, then increase to 10, 50, and finally hundreds of MP3 files.
+```bash
+docker build -t vbs-backend ./backend
+docker run -p 8080:8080 -e CORS_ORIGIN='*' vbs-backend
+```
 
-The backend processes files with controlled concurrency and never intentionally renames their relative ZIP paths. Malicious ZIP traversal paths are rejected.
+## Notes on the pipeline
+
+Each file is processed through this ffmpeg filter chain (built dynamically
+from `ProcessingSettings`):
+
+1. Optional `afftdn` noise reduction
+2. Optional `highpass` / `lowpass`
+3. Preset EQ chain (voice_focus, clear_narration, etc.)
+4. Optional de-esser (bandstop approximation)
+5. `atempo` chain for speed (auto-split when outside 0.5–2.0)
+6. `acompressor`
+7. Two-pass `loudnorm` (measured → applied)
+8. `alimiter` for true-peak ceiling
+9. Encode with `libmp3lame`
+
+The output is verified with a second `loudnorm` pass; if the measured
+LUFS is outside `verificationTolerance`, the file is re-run with dynamic
+loudnorm (`linear=false`).

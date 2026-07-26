@@ -1,19 +1,23 @@
+# Use official Node image with ffmpeg pre-installed
 FROM node:20-bookworm-slim
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg tini ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Install ffmpeg + ffprobe
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY package*.json ./
+
+# Install deps
+COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
+
+# Copy source
 COPY src ./src
-RUN mkdir -p /tmp/voice-batch-jobs && chown -R node:node /app /tmp/voice-batch-jobs
 
-USER node
+# Railway sets PORT
 ENV NODE_ENV=production
-ENV PORT=3000
-EXPOSE 3000
+ENV PORT=8080
+EXPOSE 8080
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "src/server.js"]
