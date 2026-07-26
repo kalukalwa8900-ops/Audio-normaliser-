@@ -62,21 +62,29 @@ function atempoChain(speed) {
 
 function buildProcessingFilters(settings, overrides) {
   const s = { ...settings, ...(overrides ?? {}) };
+  const mode = s.mode ?? "normalize_enhance";
   const preset = overrides?.preset ?? settings.preset ?? "original";
   const speed = overrides?.speed ?? settings.speed ?? 1;
   const chain = [];
 
-  if ((s.noiseReduction ?? 0) > 0.05) {
-    chain.push(`afftdn=nr=${Math.round(s.noiseReduction * 24)}`);
-  }
-  if (s.highPass && s.highPass > 20) chain.push(`highpass=f=${s.highPass}`);
-  if (s.lowPass && s.lowPass < 20000) chain.push(`lowpass=f=${s.lowPass}`);
+  if (mode !== "normalize") {
+    if ((s.noiseReduction ?? 0) > 0.05) {
+      chain.push(`afftdn=nr=${Math.round(s.noiseReduction * 24)}`);
+    }
+    if (s.highPass && s.highPass > 20) chain.push(`highpass=f=${s.highPass}`);
+    if (s.lowPass && s.lowPass < 20000) chain.push(`lowpass=f=${s.lowPass}`);
 
-  chain.push(...(PRESET_CHAINS[preset] ?? []));
+    chain.push(...(PRESET_CHAINS[preset] ?? []));
 
-  if ((s.deesserStrength ?? 0) > 0.1) {
-    // Simple de-esser approximation via bandstop
-    chain.push(`equalizer=f=6500:t=q:w=1.5:g=${-(s.deesserStrength * 6).toFixed(2)}`);
+    if ((s.bass ?? 0) !== 0) chain.push(`equalizer=f=120:t=q:w=1:g=${Number(s.bass).toFixed(2)}`);
+    if ((s.mid ?? 0) !== 0) chain.push(`equalizer=f=1000:t=q:w=1:g=${Number(s.mid).toFixed(2)}`);
+    if ((s.treble ?? 0) !== 0) chain.push(`equalizer=f=8000:t=q:w=1:g=${Number(s.treble).toFixed(2)}`);
+    if ((s.presence ?? 0) !== 0) chain.push(`equalizer=f=3500:t=q:w=1:g=${Number(s.presence).toFixed(2)}`);
+
+    if ((s.deesserStrength ?? 0) > 0.1) {
+      // Simple de-esser approximation via bandstop
+      chain.push(`equalizer=f=6500:t=q:w=1.5:g=${-(s.deesserStrength * 6).toFixed(2)}`);
+    }
   }
 
   if (s.speedBeforeEnhance) {
@@ -85,11 +93,17 @@ function buildProcessingFilters(settings, overrides) {
     chain.push(...atempoChain(speed));
   }
 
-  if (s.compressionRatio && s.compressionRatio > 1) {
+  if (mode !== "normalize" && s.compressionRatio && s.compressionRatio > 1) {
+    // FFmpeg acompressor's makeup value is a linear multiplier with valid range 1..64.
+    // The UI uses 0 dB as "no makeup", so convert dB to a safe multiplier.
+    const makeupDb = Number(s.makeupGain ?? 0);
+    const makeup = Math.max(1, Math.min(64, Math.pow(10, makeupDb / 20)));
     chain.push(
-      `acompressor=threshold=${s.compressionThreshold ?? -20}dB:ratio=${s.compressionRatio}:attack=${s.attack ?? 10}:release=${s.release ?? 120}:makeup=${s.makeupGain ?? 0}`,
+      `acompressor=threshold=${s.compressionThreshold ?? -20}dB:ratio=${s.compressionRatio}:attack=${s.attack ?? 10}:release=${s.release ?? 120}:makeup=${makeup.toFixed(4)}`,
     );
   }
+
+  if ((s.fadeIn ?? 0) > 0) chain.push(`afade=t=in:st=0:d=${Number(s.fadeIn).toFixed(2)}`);
 
   return chain;
 }
@@ -165,13 +179,15 @@ async function processFile({ job, file, log }) {
 
   const bitrate = settings.outputBitrate && settings.outputBitrate !== "preserve"
     ? `${settings.outputBitrate / 1000}k`
-    : "192k";
+    : originalAnalysis?.bitrate
+      ? `${Math.max(64, Math.min(320, Math.round(originalAnalysis.bitrate / 1000)))}k`
+      : "192k";
   const sr = settings.outputSampleRate && settings.outputSampleRate !== "preserve"
     ? String(settings.outputSampleRate)
-    : "44100";
+    : String(originalAnalysis?.sampleRate ?? 44100);
   const channels =
     settings.outputChannels === "mono" ? "1" :
-    settings.outputChannels === "stereo" ? "2" : "2";
+    settings.outputChannels === "stereo" ? "2" : String(originalAnalysis?.channels ?? 2);
 
   const applyArgs = [
     "-hide_banner", "-y",
