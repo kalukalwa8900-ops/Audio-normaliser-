@@ -1,153 +1,290 @@
-import Fastify from 'fastify';
-import cors from '@fastify/cors';
-import multipart from '@fastify/multipart';
-import fs from 'node:fs';
-import fsp from 'node:fs/promises';
-import path from 'node:path';
-import sanitize from 'sanitize-filename';
-import { createJob, getJob, publicJob, updateJob, cancelJob, startCleanupTimer } from './jobs.js';
-import { ensureDirs, extractZip, saveUpload } from './files.js';
-import { analyzeJob, processJob } from './pipeline.js';
-import { runCommand } from './ffmpeg.js';
+import Fastify from "fastify";
+import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
+import { nanoid } from "nanoid";
+import { promises as fs, createWriteStream, createReadStream } from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import archiver from "archiver";
+import { createJob, getJob, jobs, WORK_ROOT } from "./jobs.js";
+import { analyzeMp3, ffmpegVersion } from "./ffmpeg.js";
+import { runJob } from "./pipeline.js";
 
-const app = Fastify({ logger: true, bodyLimit: 10 * 1024 * 1024 });
-const port = Number(process.env.PORT || 3000);
-const host = process.env.HOST || '0.0.0.0';
-const jobRoot = process.env.JOB_ROOT || '/tmp/voice-batch-jobs';
-const maxUploadBytes = Number(process.env.MAX_UPLOAD_MB || 2048) * 1024 * 1024;
-const retentionMinutes = Number(process.env.JOB_RETENTION_MINUTES || 60);
-const origins = (process.env.CORS_ORIGIN || '*').split(',').map((s) => s.trim());
+const execFileP = promisify(execFile);
 
-await ensureDirs(jobRoot);
-await app.register(cors, { origin: origins.includes('*') ? true : origins, credentials: false });
-await app.register(multipart, { limits: { files: 1, fileSize: maxUploadBytes, fields: 20 } });
-startCleanupTimer(retentionMinutes);
+const PORT = Number(process.env.PORT ?? 8080);
+const HOST = "0.0.0.0";
+const CORS_ORIGIN = process.env.CORS_ORIGIN ?? "*";
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB ?? 4096);
+const JOB_TTL_SECONDS = Number(process.env.JOB_TTL_SECONDS ?? 3600);
 
-app.get('/health', async () => {
-  const [ffmpeg, ffprobe] = await Promise.all([
-    runCommand('ffmpeg', ['-version']).then(() => true).catch(() => false),
-    runCommand('ffprobe', ['-version']).then(() => true).catch(() => false)
-  ]);
-  return { ok: ffmpeg && ffprobe, ffmpeg, ffprobe, service: 'voice-batch-studio-backend' };
+const app = Fastify({
+  logger: { level: process.env.LOG_LEVEL ?? "info" },
+  bodyLimit: MAX_UPLOAD_MB * 1024 * 1024,
 });
 
-async function receiveZip(request, job) {
-  const part = await request.file();
-  if (!part) throw app.httpErrors?.badRequest?.('ZIP file is required') || new Error('ZIP file is required');
-  const original = sanitize(part.filename || 'upload.zip') || 'upload.zip';
-  if (!original.toLowerCase().endsWith('.zip')) throw new Error('Only ZIP uploads are accepted');
-  job.originalZipName = original;
-  job.inputZip = path.join(job.workDir, 'input.zip');
-  await saveUpload(part, job.inputZip, maxUploadBytes);
-  updateJob(job, { status: 'extracting', stage: 'extracting', progress: 0 });
-  const entries = await extractZip(job.inputZip, job.inputDir);
-  job.totalFiles = entries.length;
-  return entries;
-}
+await app.register(cors, {
+  origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN.split(",").map((s) => s.trim()),
+  credentials: false,
+});
 
-function initializePaths(job) {
-  job.workDir = path.join(jobRoot, job.id);
-  job.inputDir = path.join(job.workDir, 'input');
-  job.outputDir = path.join(job.workDir, 'output');
-  job.outputZip = path.join(job.workDir, 'processed.zip');
-  job.reportPath = path.join(job.workDir, 'audio_analysis_report.csv');
-}
+await app.register(multipart, {
+  limits: {
+    fileSize: MAX_UPLOAD_MB * 1024 * 1024,
+    files: 10000,
+    fields: 200,
+  },
+});
 
-app.post('/analyze', async (request, reply) => {
-  const job = createJob({ mode: 'analysis' });
-  initializePaths(job);
-  await ensureDirs(job.inputDir, job.outputDir);
+await fs.mkdir(WORK_ROOT, { recursive: true });
+
+// ---- Health ----
+app.get("/health", async () => {
+  let ff = "unknown";
   try {
-    const entries = await receiveZip(request, job);
-    void analyzeJob(job, entries).catch((error) => updateJob(job, { status: 'failed', stage: 'failed', error: error.message }, 'failed'));
-    return reply.code(202).send({ jobId: job.id, job: publicJob(job) });
-  } catch (error) {
-    updateJob(job, { status: 'failed', stage: 'failed', error: error.message }, 'failed');
-    return reply.code(400).send({ error: error.message, jobId: job.id });
+    ff = await ffmpegVersion();
+  } catch {}
+  return { version: "1.0.0", ffmpeg: ff };
+});
+
+// ---- Analyze one file ----
+app.post("/analyze", async (req, reply) => {
+  const tmpDir = path.join(WORK_ROOT, `analyze_${nanoid(10)}`);
+  await fs.mkdir(tmpDir, { recursive: true });
+  let inPath = null;
+  let relpath = "";
+  try {
+    const parts = req.parts();
+    for await (const part of parts) {
+      if (part.type === "file" && part.fieldname === "file") {
+        inPath = path.join(tmpDir, "in.mp3");
+        await new Promise((resolve, reject) => {
+          const ws = createWriteStream(inPath);
+          part.file.pipe(ws);
+          ws.on("finish", resolve);
+          ws.on("error", reject);
+          part.file.on("error", reject);
+        });
+      } else if (part.type === "field" && part.fieldname === "relpath") {
+        relpath = String(part.value ?? "");
+      }
+    }
+    if (!inPath) {
+      reply.code(400);
+      return { error: "missing file" };
+    }
+    const analysis = await analyzeMp3(inPath);
+    return analysis;
+  } catch (err) {
+    req.log.error({ err, relpath }, "analyze failed");
+    reply.code(500);
+    return { error: err.message ?? "analyze failed" };
+  } finally {
+    fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 });
 
-app.post('/jobs', async (request, reply) => {
-  const job = createJob({ mode: 'analyze_and_process' });
-  initializePaths(job);
-  await ensureDirs(job.inputDir, job.outputDir);
+// ---- Create job ----
+app.post("/jobs", async (req, reply) => {
+  const jobId = `job_${nanoid(16)}`;
+  const jobDir = path.join(WORK_ROOT, jobId);
+  const inDir = path.join(jobDir, "in");
+  const outDir = path.join(jobDir, "out");
+  await fs.mkdir(inDir, { recursive: true });
+  await fs.mkdir(outDir, { recursive: true });
+
+  let payload = null;
+  const fileMap = new Map(); // id -> local path
+
   try {
-    const entries = await receiveZip(request, job);
-    const settings = parseSettings(request.query || {});
-    void (async () => {
-      await analyzeJob(job, entries, settings);
-      await processJob(job, settings);
-    })().catch((error) => updateJob(job, { status: error.code === 'JOB_CANCELLED' ? 'cancelled' : 'failed', stage: 'failed', error: error.message }, 'failed'));
-    return reply.code(202).send({ jobId: job.id, job: publicJob(job) });
-  } catch (error) {
-    updateJob(job, { status: 'failed', stage: 'failed', error: error.message }, 'failed');
-    return reply.code(400).send({ error: error.message, jobId: job.id });
+    const parts = req.parts();
+    for await (const part of parts) {
+      if (part.type === "field" && part.fieldname === "payload") {
+        payload = JSON.parse(String(part.value));
+      } else if (part.type === "file" && part.fieldname.startsWith("file_")) {
+        const id = part.fieldname.slice("file_".length);
+        const dest = path.join(inDir, `${id}.mp3`);
+        await new Promise((resolve, reject) => {
+          const ws = createWriteStream(dest);
+          part.file.pipe(ws);
+          ws.on("finish", resolve);
+          ws.on("error", reject);
+          part.file.on("error", reject);
+        });
+        fileMap.set(id, dest);
+      }
+    }
+    if (!payload || !Array.isArray(payload.files)) {
+      reply.code(400);
+      return { error: "missing payload.files" };
+    }
+
+    const job = createJob({
+      id: jobId,
+      dir: jobDir,
+      inDir,
+      outDir,
+      settings: payload.settings,
+      files: payload.files,
+      fileMap,
+    });
+
+    // Fire and forget — SSE will report progress.
+    runJob(job, app.log).catch((err) => {
+      app.log.error({ err, jobId }, "job crashed");
+      job.progress = { ...job.progress, stage: "failed", message: err.message };
+      job.emit("progress", job.progress);
+    });
+
+    // Auto-cleanup by retention
+    const retention = payload.settings?.retention ?? "1h";
+    if (retention !== "immediate") {
+      const ttlMs = retention === "24h" ? 24 * 3600 * 1000 : JOB_TTL_SECONDS * 1000;
+      setTimeout(() => cleanupJob(jobId).catch(() => {}), ttlMs).unref?.();
+    }
+
+    return { jobId };
+  } catch (err) {
+    req.log.error({ err }, "create job failed");
+    await fs.rm(jobDir, { recursive: true, force: true }).catch(() => {});
+    reply.code(500);
+    return { error: err.message ?? "create job failed" };
   }
 });
 
-app.post('/jobs/:id/process', async (request, reply) => {
-  const job = getJob(request.params.id);
-  if (!job) return reply.code(404).send({ error: 'Job not found or expired' });
-  if (job.status !== 'analyzed') return reply.code(409).send({ error: `Job must be analyzed first; current status: ${job.status}` });
-  const settings = parseSettings(request.body || {});
-  void processJob(job, settings).catch((error) => updateJob(job, { status: error.code === 'JOB_CANCELLED' ? 'cancelled' : 'failed', stage: 'failed', error: error.message }, 'failed'));
-  return reply.code(202).send({ jobId: job.id, job: publicJob(job) });
-});
+// ---- SSE progress ----
+app.get("/jobs/:id/events", async (req, reply) => {
+  const job = getJob(req.params.id);
+  if (!job) {
+    reply.code(404);
+    return { error: "job not found" };
+  }
+  reply.raw.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "Access-Control-Allow-Origin": corsHeader(req),
+  });
+  reply.raw.write(`retry: 2000\n\n`);
 
-app.get('/jobs/:id', async (request, reply) => {
-  const job = getJob(request.params.id);
-  return job ? publicJob(job) : reply.code(404).send({ error: 'Job not found or expired' });
-});
-
-app.get('/jobs/:id/events', async (request, reply) => {
-  const job = getJob(request.params.id);
-  if (!job) return reply.code(404).send({ error: 'Job not found or expired' });
-  reply.hijack();
-  const res = reply.raw;
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-  const send = ({ event = 'message', data }) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  send({ event: 'snapshot', data: publicJob(job) });
-  const listener = (message) => send(message);
-  job.emitter.on('message', listener);
-  const heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15_000);
-  request.raw.on('close', () => { clearInterval(heartbeat); job.emitter.off('message', listener); res.end(); });
-});
-
-app.get('/jobs/:id/download', async (request, reply) => {
-  const job = getJob(request.params.id);
-  if (!job || job.status !== 'completed') return reply.code(404).send({ error: 'Processed ZIP is not ready' });
-  const name = `${path.parse(job.originalZipName || 'audio').name}_normalized.zip`;
-  reply.header('Content-Disposition', `attachment; filename="${sanitize(name)}"`).type('application/zip');
-  return reply.send(fs.createReadStream(job.outputZip));
-});
-
-app.get('/jobs/:id/report.csv', async (request, reply) => {
-  const job = getJob(request.params.id);
-  if (!job || !await exists(job.reportPath)) return reply.code(404).send({ error: 'Report is not ready' });
-  reply.header('Content-Disposition', 'attachment; filename="audio_analysis_report.csv"').type('text/csv; charset=utf-8');
-  return reply.send(fs.createReadStream(job.reportPath));
-});
-
-app.post('/jobs/:id/cancel', async (request, reply) => {
-  const job = getJob(request.params.id);
-  if (!job) return reply.code(404).send({ error: 'Job not found or expired' });
-  cancelJob(job);
-  return { ok: true, job: publicJob(job) };
-});
-
-app.setErrorHandler((error, request, reply) => {
-  request.log.error(error);
-  reply.code(error.statusCode || 500).send({ error: error.message || 'Internal server error' });
-});
-
-function parseSettings(input) {
-  return {
-    targetLufs: Number(input.targetLufs ?? -16), lra: Number(input.lra ?? 7), truePeak: Number(input.truePeak ?? -1.5),
-    speed: Number(input.speed ?? 1), preset: String(input.preset ?? 'original'), bitrateKbps: Number(input.bitrateKbps ?? 192),
-    toleranceLu: Number(input.toleranceLu ?? 0.5)
+  const send = (event, data) => {
+    reply.raw.write(`event: ${event}\n`);
+    reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
   };
+
+  // Replay latest state
+  if (job.progress) send("progress", job.progress);
+  for (const f of job.fileResults) send("file", f);
+  if (job.done) {
+    send("done", { jobId: job.id });
+    reply.raw.end();
+    return;
+  }
+
+  const onProgress = (p) => send("progress", p);
+  const onFile = (f) => send("file", f);
+  const onDone = () => {
+    send("done", { jobId: job.id });
+    reply.raw.end();
+  };
+
+  job.on("progress", onProgress);
+  job.on("file", onFile);
+  job.on("done", onDone);
+
+  const keepalive = setInterval(() => {
+    reply.raw.write(`: keepalive\n\n`);
+  }, 15000);
+
+  req.raw.on("close", () => {
+    clearInterval(keepalive);
+    job.off("progress", onProgress);
+    job.off("file", onFile);
+    job.off("done", onDone);
+  });
+
+  return reply;
+});
+
+// ---- Download final ZIP ----
+app.get("/jobs/:id/download", async (req, reply) => {
+  const job = getJob(req.params.id);
+  if (!job) {
+    reply.code(404);
+    return { error: "job not found" };
+  }
+  const zipPath = path.join(job.dir, "result.zip");
+  try {
+    await fs.access(zipPath);
+  } catch {
+    reply.code(409);
+    return { error: "job not ready" };
+  }
+  reply.header("Content-Type", "application/zip");
+  reply.header(
+    "Content-Disposition",
+    `attachment; filename="voice_batch_${job.id}.zip"`,
+  );
+  const stream = createReadStream(zipPath);
+  reply.send(stream);
+
+  if (job.retention === "immediate") {
+    stream.on("close", () => cleanupJob(job.id).catch(() => {}));
+  }
+  return reply;
+});
+
+// ---- Report ----
+app.get("/jobs/:id/report.csv", async (req, reply) => {
+  const job = getJob(req.params.id);
+  if (!job) {
+    reply.code(404);
+    return { error: "job not found" };
+  }
+  const csvPath = path.join(job.dir, "report.csv");
+  try {
+    await fs.access(csvPath);
+  } catch {
+    reply.code(409);
+    return { error: "report not ready" };
+  }
+  reply.header("Content-Type", "text/csv");
+  reply.send(createReadStream(csvPath));
+  return reply;
+});
+
+// ---- Cancel ----
+app.post("/jobs/:id/cancel", async (req, reply) => {
+  const job = getJob(req.params.id);
+  if (!job) {
+    reply.code(404);
+    return { error: "job not found" };
+  }
+  job.cancelled = true;
+  reply.code(204).send();
+});
+
+// ---- helpers ----
+function corsHeader(req) {
+  const origin = req.headers.origin;
+  if (!origin) return "*";
+  if (CORS_ORIGIN === "*") return origin;
+  const allowed = CORS_ORIGIN.split(",").map((s) => s.trim());
+  return allowed.includes(origin) ? origin : allowed[0];
 }
 
-async function exists(file) { try { await fsp.access(file); return true; } catch { return false; } }
+async function cleanupJob(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+  jobs.delete(jobId);
+  await fs.rm(job.dir, { recursive: true, force: true }).catch(() => {});
+}
 
-await app.listen({ port, host });
+// Export archiver so ESM tree-shaking keeps it (used inside pipeline.js).
+export { archiver };
+
+app.listen({ port: PORT, host: HOST }).then(() => {
+  app.log.info(`Voice Batch Studio backend listening on ${HOST}:${PORT}`);
+});
