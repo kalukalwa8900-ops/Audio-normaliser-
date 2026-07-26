@@ -109,18 +109,6 @@ function buildProcessingFilters(settings, overrides) {
   return chain;
 }
 
-async function measureLoudness(inPath, targetLufs, tp, lra) {
-  const { stderr } = await runFfmpeg([
-    "-hide_banner",
-    "-i", inPath,
-    "-af",
-    `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:print_format=json`,
-    "-f", "null",
-    "-",
-  ]);
-  return parseLoudnormJson(stderr);
-}
-
 async function processFile({ job, file, log }) {
   const settings = job.settings;
   const overrides = file.overrides ?? {};
@@ -136,47 +124,20 @@ async function processFile({ job, file, log }) {
 
   const preFilters = buildProcessingFilters(settings, overrides);
 
-  // Intermediate WAV so loudnorm two-pass can measure post-enhancement audio.
-  const stageDir = path.join(job.dir, `stage_${file.id}`);
-  await fs.mkdir(stageDir, { recursive: true });
-  const stagedWav = path.join(stageDir, "staged.wav");
-
-  const stageArgs = [
-    "-hide_banner", "-y",
-    "-i", inPath,
-  ];
-  if (preFilters.length > 0) {
-    stageArgs.push("-af", preFilters.join(","));
-  }
-  stageArgs.push("-ar", "48000", "-ac", "2", stagedWav);
-  await runFfmpeg(stageArgs);
-
-  // Pass 1: measure
-  const measured = await measureLoudness(stagedWav, targetLufs, tp, lra);
-  const limiterCeiling = tp;
-
-  // Pass 2: apply
+  // OPTIMIZATION: Single-pass processing instead of 3 separate FFmpeg invocations
+  // Old pipeline: Stage (encode to WAV) → Measure loudness → Apply normalized loudness + limiter
+  // New pipeline: Apply all + loudnorm + limiter directly in one pass
+  
   const outRel = file.folder
     ? path.join(file.folder, file.name)
     : file.name;
   const outAbs = path.join(job.outDir, outRel);
   await fs.mkdir(path.dirname(outAbs), { recursive: true });
 
-  const applyFilters = [];
-  if (measured) {
-    applyFilters.push(
-      `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}` +
-        `:measured_I=${measured.input_i}` +
-        `:measured_LRA=${measured.input_lra}` +
-        `:measured_TP=${measured.input_tp}` +
-        `:measured_thresh=${measured.input_thresh}` +
-        `:offset=${measured.target_offset}` +
-        `:linear=true:print_format=summary`,
-    );
-  } else {
-    applyFilters.push(`loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}`);
-  }
-  applyFilters.push(`alimiter=limit=${limiterCeiling}dB`);
+  // Build complete filter chain: enhancements → loudnorm → limiter
+  const allFilters = [...preFilters];
+  allFilters.push(`loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:print_format=json`);
+  allFilters.push(`alimiter=limit=${tp}dB`);
 
   const bitrate = settings.outputBitrate && settings.outputBitrate !== "preserve"
     ? `${settings.outputBitrate / 1000}k`
@@ -190,19 +151,20 @@ async function processFile({ job, file, log }) {
     settings.outputChannels === "mono" ? "1" :
     settings.outputChannels === "stereo" ? "2" : String(originalAnalysis?.channels ?? 2);
 
-  const applyArgs = [
+  // Single FFmpeg call: input → filters → loudnorm → limiter → MP3 encode
+  const encodeArgs = [
     "-hide_banner", "-y",
-    "-i", stagedWav,
-    "-af", applyFilters.join(","),
+    "-i", inPath,
+    "-af", allFilters.join(","),
     "-ar", sr,
     "-ac", channels,
     "-c:a", "libmp3lame",
     "-b:a", bitrate,
     outAbs,
   ];
-  await runFfmpeg(applyArgs);
+  await runFfmpeg(encodeArgs);
 
-  // Verify
+  // Verify output loudness with single analysis
   let finalAnalysis = null;
   let verificationPassed = true;
   if (settings.verifyOutput !== false) {
@@ -212,18 +174,19 @@ async function processFile({ job, file, log }) {
       finalAnalysis?.lufs != null &&
       Math.abs(finalAnalysis.lufs - targetLufs) > tol
     ) {
-      // Retry with dynamic loudnorm
+      // If verification fails, retry with dynamic loudnorm (second pass only)
       log.warn?.(
         { id: file.id, measured: finalAnalysis.lufs, target: targetLufs },
-        "verification miss — retrying with linear=false",
+        "verification miss — retrying with dynamic loudnorm",
       );
       const retryFilters = [
+        ...preFilters,
         `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:linear=false:print_format=summary`,
-        `alimiter=limit=${limiterCeiling}dB`,
+        `alimiter=limit=${tp}dB`,
       ];
       await runFfmpeg([
         "-hide_banner", "-y",
-        "-i", stagedWav,
+        "-i", inPath,
         "-af", retryFilters.join(","),
         "-ar", sr,
         "-ac", channels,
@@ -237,8 +200,6 @@ async function processFile({ job, file, log }) {
         Math.abs(finalAnalysis.lufs - targetLufs) <= tol * 1.5;
     }
   }
-
-  await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
 
   const outStat = await fs.stat(outAbs).catch(() => null);
   return {
@@ -396,7 +357,6 @@ export async function runJob(job, log) {
         "", "", "", "", "failed", msg,
       ];
     } finally {
-      await fs.rm(path.join(job.dir, `stage_${file.id}`), { recursive: true, force: true }).catch(() => {});
       active.delete(file.id);
       updateProgress();
     }
