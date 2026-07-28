@@ -124,6 +124,13 @@ function hasUsableLoudnormMeasurement(measured) {
   );
 }
 
+// Hard floor: below these, normalized speech is not usably audible even if the
+// LUFS math checks out (a file with a few loud transients but mostly quiet
+// speech can average out to a "correct" integrated LUFS while sounding
+// whisper-quiet). This floor is NOT configurable via job settings.
+const HARD_MIN_MAX_PEAK_DB = -18;
+const HARD_MIN_RMS_DB = -30;
+
 function outputLooksAudible(analysis, targetLufs, tolerance) {
   if (!analysis) return false;
   const lufs = finiteMeasurementValue(analysis.lufs);
@@ -135,9 +142,21 @@ function outputLooksAudible(analysis, targetLufs, tolerance) {
   // FFmpeg success exit code from being mistaken for a healthy audio result.
   if (lufs == null) return false;
   if (Math.abs(lufs - targetLufs) > tolerance) return false;
-  if (maxPeak != null && maxPeak < -30) return false;
-  if (rms != null && rms < -42) return false;
+  if (maxPeak != null && maxPeak < HARD_MIN_MAX_PEAK_DB) return false;
+  if (rms != null && rms < HARD_MIN_RMS_DB) return false;
   return true;
+}
+
+// Independent of settings.verifyOutput / tolerance — the absolute floor that
+// decides whether a file is audible at all. verifyOutput:false only skips the
+// LUFS-target comparison in outputLooksAudible, never this check.
+function outputIsHardSilent(analysis) {
+  if (!analysis) return true;
+  const maxPeak = finiteMeasurementValue(analysis.maxPeak);
+  const rms = finiteMeasurementValue(analysis.rms);
+  if (maxPeak != null && maxPeak < HARD_MIN_MAX_PEAK_DB) return true;
+  if (rms != null && rms < HARD_MIN_RMS_DB) return true;
+  return false;
 }
 
 async function measureLoudness(inPath, targetLufs, tp, lra) {
@@ -234,52 +253,96 @@ async function processFile({ job, file, log }) {
   await runFfmpeg(applyArgs);
 
   // Verify. A missing LUFS reading or near-silent peak/RMS is a failure too.
-  let finalAnalysis = null;
+  // The LUFS-target comparison can be relaxed via settings.verifyOutput /
+  // verificationTolerance, but the hard audibility floor below always runs —
+  // it cannot be turned off from job settings, so a misconfigured or stale
+  // frontend can never cause a whisper-quiet file to be shipped as "ok".
+  let finalAnalysis = await analyzeMp3(outAbs).catch(() => null);
   let verificationPassed = true;
-  if (settings.verifyOutput !== false) {
-    const tol = Number(settings.verificationTolerance ?? 1.0);
+  const verifyLoudnessTarget = settings.verifyOutput !== false;
+  const tol = Number(settings.verificationTolerance ?? 1.0);
+
+  verificationPassed = verifyLoudnessTarget
+    ? outputLooksAudible(finalAnalysis, targetLufs, tol)
+    : !outputIsHardSilent(finalAnalysis);
+
+  if (!verificationPassed) {
+    // Retry with dynamic loudnorm. This is safer for very short clips,
+    // unusual dynamics, and files where the measured linear pass is invalid.
+    log.warn?.(
+      {
+        id: file.id,
+        measured: finalAnalysis?.lufs,
+        maxPeak: finalAnalysis?.maxPeak,
+        rms: finalAnalysis?.rms,
+        target: targetLufs,
+      },
+      "verification miss or near-silent output — retrying with dynamic loudnorm",
+    );
+    const retryFilters = [
+      `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:linear=false:print_format=summary`,
+      `alimiter=limit=${limiterCeiling}dB`,
+    ];
+    await runFfmpeg([
+      "-hide_banner", "-y",
+      "-i", stagedWav,
+      "-af", retryFilters.join(","),
+      "-ar", sr,
+      "-ac", channels,
+      "-c:a", "libmp3lame",
+      "-b:a", bitrate,
+      outAbs,
+    ]);
     finalAnalysis = await analyzeMp3(outAbs).catch(() => null);
-    verificationPassed = outputLooksAudible(finalAnalysis, targetLufs, tol);
+    verificationPassed = verifyLoudnessTarget
+      ? outputLooksAudible(finalAnalysis, targetLufs, tol * 1.5)
+      : !outputIsHardSilent(finalAnalysis);
+  }
 
-    if (!verificationPassed) {
-      // Retry with dynamic loudnorm. This is safer for very short clips,
-      // unusual dynamics, and files where the measured linear pass is invalid.
-      log.warn?.(
-        {
-          id: file.id,
-          measured: finalAnalysis?.lufs,
-          maxPeak: finalAnalysis?.maxPeak,
-          rms: finalAnalysis?.rms,
-          target: targetLufs,
-        },
-        "verification miss or near-silent output — retrying with dynamic loudnorm",
-      );
-      const retryFilters = [
-        `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:linear=false:print_format=summary`,
-        `alimiter=limit=${limiterCeiling}dB`,
-      ];
-      await runFfmpeg([
-        "-hide_banner", "-y",
-        "-i", stagedWav,
-        "-af", retryFilters.join(","),
-        "-ar", sr,
-        "-ac", channels,
-        "-c:a", "libmp3lame",
-        "-b:a", bitrate,
-        outAbs,
-      ]);
-      finalAnalysis = await analyzeMp3(outAbs).catch(() => null);
-      verificationPassed = outputLooksAudible(finalAnalysis, targetLufs, tol * 1.5);
-    }
+  if (!verificationPassed && outputIsHardSilent(finalAnalysis)) {
+    // Last resort: force a straight gain boost off the actually-measured level
+    // of the retry output, rather than dropping the file. This is what fixes
+    // "some files come out too quiet to hear" — instead of failing the file
+    // (which just silently excludes it from the zip), we push its peak up to
+    // just under the limiter ceiling so it's audible, even if that means it
+    // no longer sits exactly at the target integrated LUFS.
+    const measuredPeak = finiteMeasurementValue(finalAnalysis?.maxPeak);
+    const headroom = 1.0; // dB below the limiter ceiling / 0dBFS
+    const forcedGainDb = measuredPeak != null
+      ? Math.min(24, Math.max(0, (limiterCeiling - headroom) - measuredPeak))
+      : 18; // no usable measurement at all — apply a large flat boost
 
-    if (!verificationPassed) {
-      // Never silently package an inaudible result. Failing this file is safer
-      // than replacing a usable source MP3 with an effectively silent output.
-      throw new Error(
-        `output audio failed loudness safety check (LUFS=${finalAnalysis?.lufs ?? "unmeasurable"}, ` +
-        `peak=${finalAnalysis?.maxPeak ?? "unmeasurable"} dB, RMS=${finalAnalysis?.rms ?? "unmeasurable"} dB)`,
-      );
-    }
+    log.warn?.(
+      { id: file.id, forcedGainDb, measuredPeak },
+      "still inaudible after retry — applying forced gain repair pass",
+    );
+
+    const repairFilters = [
+      `volume=${forcedGainDb.toFixed(2)}dB`,
+      `alimiter=limit=${limiterCeiling}dB`,
+    ];
+    await runFfmpeg([
+      "-hide_banner", "-y",
+      "-i", stagedWav,
+      "-af", repairFilters.join(","),
+      "-ar", sr,
+      "-ac", channels,
+      "-c:a", "libmp3lame",
+      "-b:a", bitrate,
+      outAbs,
+    ]);
+    finalAnalysis = await analyzeMp3(outAbs).catch(() => null);
+    verificationPassed = !outputIsHardSilent(finalAnalysis);
+  }
+
+  if (!verificationPassed) {
+    // Only reaches here if the source itself is genuinely silent/corrupted
+    // (forced gain couldn't recover it either) — safer to fail than to ship
+    // amplified noise/silence.
+    throw new Error(
+      `output audio failed loudness safety check (LUFS=${finalAnalysis?.lufs ?? "unmeasurable"}, ` +
+      `peak=${finalAnalysis?.maxPeak ?? "unmeasurable"} dB, RMS=${finalAnalysis?.rms ?? "unmeasurable"} dB)`,
+    );
   }
 
   await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
