@@ -108,6 +108,38 @@ function buildProcessingFilters(settings, overrides) {
   return chain;
 }
 
+function finiteMeasurementValue(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function hasUsableLoudnormMeasurement(measured) {
+  return Boolean(
+    measured &&
+    finiteMeasurementValue(measured.input_i) != null &&
+    finiteMeasurementValue(measured.input_lra) != null &&
+    finiteMeasurementValue(measured.input_tp) != null &&
+    finiteMeasurementValue(measured.input_thresh) != null &&
+    finiteMeasurementValue(measured.target_offset) != null
+  );
+}
+
+function outputLooksAudible(analysis, targetLufs, tolerance) {
+  if (!analysis) return false;
+  const lufs = finiteMeasurementValue(analysis.lufs);
+  const maxPeak = finiteMeasurementValue(analysis.maxPeak);
+  const rms = finiteMeasurementValue(analysis.rms);
+
+  // A normalized spoken-word file should always have a measurable loudness and
+  // should not have peaks/RMS at near-silence levels. These guards prevent an
+  // FFmpeg success exit code from being mistaken for a healthy audio result.
+  if (lufs == null) return false;
+  if (Math.abs(lufs - targetLufs) > tolerance) return false;
+  if (maxPeak != null && maxPeak < -30) return false;
+  if (rms != null && rms < -42) return false;
+  return true;
+}
+
 async function measureLoudness(inPath, targetLufs, tp, lra) {
   const { stderr } = await runFfmpeg([
     "-hide_banner",
@@ -162,7 +194,7 @@ async function processFile({ job, file, log }) {
   await fs.mkdir(path.dirname(outAbs), { recursive: true });
 
   const applyFilters = [];
-  if (measured) {
+  if (hasUsableLoudnormMeasurement(measured)) {
     applyFilters.push(
       `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}` +
         `:measured_I=${measured.input_i}` +
@@ -201,20 +233,26 @@ async function processFile({ job, file, log }) {
   ];
   await runFfmpeg(applyArgs);
 
-  // Verify
+  // Verify. A missing LUFS reading or near-silent peak/RMS is a failure too.
   let finalAnalysis = null;
   let verificationPassed = true;
   if (settings.verifyOutput !== false) {
+    const tol = Number(settings.verificationTolerance ?? 1.0);
     finalAnalysis = await analyzeMp3(outAbs).catch(() => null);
-    const tol = settings.verificationTolerance ?? 1.0;
-    if (
-      finalAnalysis?.lufs != null &&
-      Math.abs(finalAnalysis.lufs - targetLufs) > tol
-    ) {
-      // Retry with dynamic loudnorm
+    verificationPassed = outputLooksAudible(finalAnalysis, targetLufs, tol);
+
+    if (!verificationPassed) {
+      // Retry with dynamic loudnorm. This is safer for very short clips,
+      // unusual dynamics, and files where the measured linear pass is invalid.
       log.warn?.(
-        { id: file.id, measured: finalAnalysis.lufs, target: targetLufs },
-        "verification miss — retrying with linear=false",
+        {
+          id: file.id,
+          measured: finalAnalysis?.lufs,
+          maxPeak: finalAnalysis?.maxPeak,
+          rms: finalAnalysis?.rms,
+          target: targetLufs,
+        },
+        "verification miss or near-silent output — retrying with dynamic loudnorm",
       );
       const retryFilters = [
         `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:linear=false:print_format=summary`,
@@ -231,9 +269,16 @@ async function processFile({ job, file, log }) {
         outAbs,
       ]);
       finalAnalysis = await analyzeMp3(outAbs).catch(() => null);
-      verificationPassed =
-        finalAnalysis?.lufs != null &&
-        Math.abs(finalAnalysis.lufs - targetLufs) <= tol * 1.5;
+      verificationPassed = outputLooksAudible(finalAnalysis, targetLufs, tol * 1.5);
+    }
+
+    if (!verificationPassed) {
+      // Never silently package an inaudible result. Failing this file is safer
+      // than replacing a usable source MP3 with an effectively silent output.
+      throw new Error(
+        `output audio failed loudness safety check (LUFS=${finalAnalysis?.lufs ?? "unmeasurable"}, ` +
+        `peak=${finalAnalysis?.maxPeak ?? "unmeasurable"} dB, RMS=${finalAnalysis?.rms ?? "unmeasurable"} dB)`,
+      );
     }
   }
 

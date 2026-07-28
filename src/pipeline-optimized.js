@@ -161,8 +161,24 @@ async function processFileOptimized({ job, file, log }) {
 
   // Parse loudness from single pass
   let finalAnalysis = null;
+  let verificationPassed = true;
   if (settings.verifyOutput !== false) {
     finalAnalysis = await analyzeMp3(outAbs).catch(() => null);
+    const tol = Number(settings.verificationTolerance ?? 1.0);
+    const lufs = Number(finalAnalysis?.lufs);
+    const maxPeak = Number(finalAnalysis?.maxPeak);
+    const rms = Number(finalAnalysis?.rms);
+    verificationPassed =
+      Number.isFinite(lufs) &&
+      Math.abs(lufs - targetLufs) <= tol * 1.5 &&
+      (!Number.isFinite(maxPeak) || maxPeak >= -30) &&
+      (!Number.isFinite(rms) || rms >= -42);
+    if (!verificationPassed) {
+      throw new Error(
+        `output audio failed loudness safety check (LUFS=${finalAnalysis?.lufs ?? "unmeasurable"}, ` +
+        `peak=${finalAnalysis?.maxPeak ?? "unmeasurable"} dB, RMS=${finalAnalysis?.rms ?? "unmeasurable"} dB)`,
+      );
+    }
   }
 
   const outStat = await fs.stat(outAbs).catch(() => null);
@@ -175,7 +191,7 @@ async function processFileOptimized({ job, file, log }) {
       finalTruePeak: finalAnalysis?.truePeak,
       finalDuration: finalAnalysis?.duration,
       outputSize: outStat?.size,
-      verificationPassed: true,
+      verificationPassed,
     },
   };
 }
