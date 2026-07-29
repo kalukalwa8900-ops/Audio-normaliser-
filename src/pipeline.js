@@ -1,9 +1,19 @@
 import { promises as fs, createWriteStream } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import path from "node:path";
-import archiver from "archiver";
-import { runFfmpeg, parseLoudnormJson, analyzeMp3 } from "./ffmpeg.js";
+import { analyzeMp3, measureLoudness, measureVolume, runFfmpeg } from "./ffmpeg.js";
+import { createFfmpegLimiter } from "./concurrency.js";
+import { csvEscape, safeOutputPath } from "./files.js";
+import { finishJob } from "./jobs.js";
 
-const PRESET_CHAINS = {
+export const REQUIRED_TARGET_LUFS = -16;
+export const REQUIRED_TOLERANCE_LU = 0.3;
+export const REQUIRED_TRUE_PEAK_DBTP = -1.5;
+const DEFAULT_TARGET_LRA = 7;
+const MAX_NORMALIZATION_ATTEMPTS = 3;
+
+const PRESET_CHAINS = Object.freeze({
   original: [],
   voice_focus: [
     "highpass=f=80",
@@ -41,449 +51,637 @@ const PRESET_CHAINS = {
     "highpass=f=100",
     "equalizer=f=3000:t=q:w=1:g=1.5",
   ],
-};
+});
 
-function atempoChain(speed) {
-  const s = Math.max(0.25, Math.min(4, Number(speed) || 1));
-  if (s === 1) return [];
-  const parts = [];
-  let remaining = s;
-  while (remaining > 2.0) {
-    parts.push("atempo=2.0");
-    remaining /= 2.0;
+const limiterPromise = createFfmpegLimiter();
+const execFileP = promisify(execFile);
+
+function finiteNumber(value, fallback, minimum = -Infinity, maximum = Infinity) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(maximum, Math.max(minimum, number));
+}
+
+function atempoChain(value) {
+  const speed = finiteNumber(value, 1, 0.25, 4);
+  if (Math.abs(speed - 1) < 0.0001) return [];
+  const filters = [];
+  let remaining = speed;
+  while (remaining > 2) {
+    filters.push("atempo=2");
+    remaining /= 2;
   }
   while (remaining < 0.5) {
-    parts.push("atempo=0.5");
+    filters.push("atempo=0.5");
     remaining /= 0.5;
   }
-  parts.push(`atempo=${remaining.toFixed(4)}`);
-  return parts;
+  if (Math.abs(remaining - 1) >= 0.0001) filters.push(`atempo=${remaining.toFixed(6)}`);
+  return filters;
 }
 
-function buildProcessingFilters(settings, overrides) {
-  const s = { ...settings, ...(overrides ?? {}) };
-  const mode = s.mode ?? "normalize_enhance";
-  const preset = overrides?.preset ?? settings.preset ?? "original";
-  const speed = overrides?.speed ?? settings.speed ?? 1;
-  const chain = [];
+function buildProcessingFilters(settings, overrides = {}) {
+  const values = { ...settings, ...overrides };
+  const mode = values.mode === "normalize" ? "normalize" : "normalize_enhance";
+  const preset = Object.hasOwn(PRESET_CHAINS, values.preset) ? values.preset : "original";
+  const filters = [];
+  const speedFilters = atempoChain(values.speed);
+
+  if (values.speedBeforeEnhance) filters.push(...speedFilters);
 
   if (mode !== "normalize") {
-    if ((s.noiseReduction ?? 0) > 0.05) {
-      chain.push(`afftdn=nr=${Math.round(s.noiseReduction * 24)}`);
-    }
-    if (s.highPass && s.highPass > 20) chain.push(`highpass=f=${s.highPass}`);
-    if (s.lowPass && s.lowPass < 20000) chain.push(`lowpass=f=${s.lowPass}`);
+    const noiseReduction = finiteNumber(values.noiseReduction, 0, 0, 1);
+    if (noiseReduction > 0.05) filters.push(`afftdn=nr=${Math.round(noiseReduction * 24)}`);
 
-    chain.push(...(PRESET_CHAINS[preset] ?? []));
+    const highPass = finiteNumber(values.highPass, 0, 0, 20_000);
+    const lowPass = finiteNumber(values.lowPass, 20_000, 20, 22_000);
+    if (highPass > 20) filters.push(`highpass=f=${highPass.toFixed(0)}`);
+    if (lowPass < 20_000) filters.push(`lowpass=f=${lowPass.toFixed(0)}`);
 
-    if ((s.bass ?? 0) !== 0) chain.push(`equalizer=f=120:t=q:w=1:g=${Number(s.bass).toFixed(2)}`);
-    if ((s.mid ?? 0) !== 0) chain.push(`equalizer=f=1000:t=q:w=1:g=${Number(s.mid).toFixed(2)}`);
-    if ((s.treble ?? 0) !== 0) chain.push(`equalizer=f=8000:t=q:w=1:g=${Number(s.treble).toFixed(2)}`);
-    if ((s.presence ?? 0) !== 0) chain.push(`equalizer=f=3500:t=q:w=1:g=${Number(s.presence).toFixed(2)}`);
+    filters.push(...PRESET_CHAINS[preset]);
 
-    if ((s.deesserStrength ?? 0) > 0.1) {
-      // Simple de-esser approximation via bandstop
-      chain.push(`equalizer=f=6500:t=q:w=1.5:g=${-(s.deesserStrength * 6).toFixed(2)}`);
-    }
-  }
-
-  if (s.speedBeforeEnhance) {
-    chain.unshift(...atempoChain(speed));
-  } else {
-    chain.push(...atempoChain(speed));
-  }
-
-  if (mode !== "normalize" && s.compressionRatio && s.compressionRatio > 1) {
-    // FFmpeg acompressor's makeup value is a linear multiplier with valid range 1..64.
-    // The UI uses 0 dB as "no makeup", so convert dB to a safe multiplier.
-    const makeupDb = Number(s.makeupGain ?? 0);
-    const makeup = Math.max(1, Math.min(64, Math.pow(10, makeupDb / 20)));
-    chain.push(
-      `acompressor=threshold=${s.compressionThreshold ?? -20}dB:ratio=${s.compressionRatio}:attack=${s.attack ?? 10}:release=${s.release ?? 120}:makeup=${makeup.toFixed(4)}`,
-    );
-  }
-
-  if ((s.fadeIn ?? 0) > 0) chain.push(`afade=t=in:st=0:d=${Number(s.fadeIn).toFixed(2)}`);
-
-  return chain;
-}
-
-function finiteMeasurementValue(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function hasUsableLoudnormMeasurement(measured) {
-  return Boolean(
-    measured &&
-    finiteMeasurementValue(measured.input_i) != null &&
-    finiteMeasurementValue(measured.input_lra) != null &&
-    finiteMeasurementValue(measured.input_tp) != null &&
-    finiteMeasurementValue(measured.input_thresh) != null &&
-    finiteMeasurementValue(measured.target_offset) != null
-  );
-}
-
-// Hard floor: below these, normalized speech is not usably audible even if the
-// LUFS math checks out (a file with a few loud transients but mostly quiet
-// speech can average out to a "correct" integrated LUFS while sounding
-// whisper-quiet). This floor is NOT configurable via job settings.
-const HARD_MIN_MAX_PEAK_DB = -18;
-const HARD_MIN_RMS_DB = -30;
-
-function outputLooksAudible(analysis, targetLufs, tolerance) {
-  if (!analysis) return false;
-  const lufs = finiteMeasurementValue(analysis.lufs);
-  const maxPeak = finiteMeasurementValue(analysis.maxPeak);
-  const rms = finiteMeasurementValue(analysis.rms);
-
-  // A normalized spoken-word file should always have a measurable loudness and
-  // should not have peaks/RMS at near-silence levels. These guards prevent an
-  // FFmpeg success exit code from being mistaken for a healthy audio result.
-  if (lufs == null) return false;
-  if (Math.abs(lufs - targetLufs) > tolerance) return false;
-  if (maxPeak != null && maxPeak < HARD_MIN_MAX_PEAK_DB) return false;
-  if (rms != null && rms < HARD_MIN_RMS_DB) return false;
-  return true;
-}
-
-// Independent of settings.verifyOutput / tolerance — the absolute floor that
-// decides whether a file is audible at all. verifyOutput:false only skips the
-// LUFS-target comparison in outputLooksAudible, never this check.
-function outputIsHardSilent(analysis) {
-  if (!analysis) return true;
-  const maxPeak = finiteMeasurementValue(analysis.maxPeak);
-  const rms = finiteMeasurementValue(analysis.rms);
-  if (maxPeak != null && maxPeak < HARD_MIN_MAX_PEAK_DB) return true;
-  if (rms != null && rms < HARD_MIN_RMS_DB) return true;
-  return false;
-}
-
-async function measureLoudness(inPath, targetLufs, tp, lra) {
-  const { stderr } = await runFfmpeg([
-    "-hide_banner",
-    "-i", inPath,
-    "-af",
-    `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:print_format=json`,
-    "-f", "null",
-    "-",
-  ]);
-  return parseLoudnormJson(stderr);
-}
-
-async function processFile({ job, file, log }) {
-  const settings = job.settings;
-  const overrides = file.overrides ?? {};
-  const inPath = job.fileMap.get(file.id);
-  if (!inPath) throw new Error("input file missing");
-
-  const targetLufs = overrides.targetLufs ?? settings.targetLufs ?? -16;
-  const tp = settings.truePeak ?? -1.5;
-  const lra = settings.loudnessRange ?? 7;
-
-  // Pre-analysis for report
-  const originalAnalysis = await analyzeMp3(inPath).catch(() => null);
-
-  const preFilters = buildProcessingFilters(settings, overrides);
-
-  // Intermediate WAV so loudnorm two-pass can measure post-enhancement audio.
-  const stageDir = path.join(job.dir, `stage_${file.id}`);
-  await fs.mkdir(stageDir, { recursive: true });
-  const stagedWav = path.join(stageDir, "staged.wav");
-
-  const stageArgs = [
-    "-hide_banner", "-y",
-    "-i", inPath,
-  ];
-  if (preFilters.length > 0) {
-    stageArgs.push("-af", preFilters.join(","));
-  }
-  stageArgs.push("-ar", "48000", "-ac", "2", stagedWav);
-  await runFfmpeg(stageArgs);
-
-  // Pass 1: measure
-  const measured = await measureLoudness(stagedWav, targetLufs, tp, lra);
-  const limiterCeiling = tp;
-
-  // Pass 2: apply
-  const outRel = file.folder
-    ? path.join(file.folder, file.name)
-    : file.name;
-  const outAbs = path.join(job.outDir, outRel);
-  await fs.mkdir(path.dirname(outAbs), { recursive: true });
-
-  const applyFilters = [];
-  if (hasUsableLoudnormMeasurement(measured)) {
-    applyFilters.push(
-      `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}` +
-        `:measured_I=${measured.input_i}` +
-        `:measured_LRA=${measured.input_lra}` +
-        `:measured_TP=${measured.input_tp}` +
-        `:measured_thresh=${measured.input_thresh}` +
-        `:offset=${measured.target_offset}` +
-        `:linear=true:print_format=summary`,
-    );
-  } else {
-    applyFilters.push(`loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}`);
-  }
-  applyFilters.push(`alimiter=limit=${limiterCeiling}dB`);
-
-  const bitrate = settings.outputBitrate && settings.outputBitrate !== "preserve"
-    ? `${settings.outputBitrate / 1000}k`
-    : originalAnalysis?.bitrate
-      ? `${Math.max(64, Math.min(320, Math.round(originalAnalysis.bitrate / 1000)))}k`
-      : "192k";
-  const sr = settings.outputSampleRate && settings.outputSampleRate !== "preserve"
-    ? String(settings.outputSampleRate)
-    : String(originalAnalysis?.sampleRate ?? 44100);
-  const channels =
-    settings.outputChannels === "mono" ? "1" :
-    settings.outputChannels === "stereo" ? "2" : String(originalAnalysis?.channels ?? 2);
-
-  const applyArgs = [
-    "-hide_banner", "-y",
-    "-i", stagedWav,
-    "-af", applyFilters.join(","),
-    "-ar", sr,
-    "-ac", channels,
-    "-c:a", "libmp3lame",
-    "-b:a", bitrate,
-    outAbs,
-  ];
-  await runFfmpeg(applyArgs);
-
-  // Verify. A missing LUFS reading or near-silent peak/RMS is a failure too.
-  // The LUFS-target comparison can be relaxed via settings.verifyOutput /
-  // verificationTolerance, but the hard audibility floor below always runs —
-  // it cannot be turned off from job settings, so a misconfigured or stale
-  // frontend can never cause a whisper-quiet file to be shipped as "ok".
-  let finalAnalysis = await analyzeMp3(outAbs).catch(() => null);
-  let verificationPassed = true;
-  const verifyLoudnessTarget = settings.verifyOutput !== false;
-  const tol = Number(settings.verificationTolerance ?? 1.0);
-
-  verificationPassed = verifyLoudnessTarget
-    ? outputLooksAudible(finalAnalysis, targetLufs, tol)
-    : !outputIsHardSilent(finalAnalysis);
-
-  if (!verificationPassed) {
-    // Retry with dynamic loudnorm. This is safer for very short clips,
-    // unusual dynamics, and files where the measured linear pass is invalid.
-    log.warn?.(
-      {
-        id: file.id,
-        measured: finalAnalysis?.lufs,
-        maxPeak: finalAnalysis?.maxPeak,
-        rms: finalAnalysis?.rms,
-        target: targetLufs,
-      },
-      "verification miss or near-silent output — retrying with dynamic loudnorm",
-    );
-    const retryFilters = [
-      `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}:linear=false:print_format=summary`,
-      `alimiter=limit=${limiterCeiling}dB`,
+    const eqBands = [
+      ["bass", 120],
+      ["mid", 1000],
+      ["presence", 3500],
+      ["treble", 8000],
     ];
-    await runFfmpeg([
-      "-hide_banner", "-y",
-      "-i", stagedWav,
-      "-af", retryFilters.join(","),
-      "-ar", sr,
-      "-ac", channels,
-      "-c:a", "libmp3lame",
-      "-b:a", bitrate,
-      outAbs,
-    ]);
-    finalAnalysis = await analyzeMp3(outAbs).catch(() => null);
-    verificationPassed = verifyLoudnessTarget
-      ? outputLooksAudible(finalAnalysis, targetLufs, tol * 1.5)
-      : !outputIsHardSilent(finalAnalysis);
+    for (const [key, frequency] of eqBands) {
+      const gain = finiteNumber(values[key], 0, -12, 12);
+      if (Math.abs(gain) > 0.001) {
+        filters.push(`equalizer=f=${frequency}:t=q:w=1:g=${gain.toFixed(2)}`);
+      }
+    }
+
+    const deesser = finiteNumber(values.deesserStrength, 0, 0, 1);
+    if (deesser > 0.1) {
+      filters.push(`equalizer=f=6500:t=q:w=1.5:g=${(-deesser * 6).toFixed(2)}`);
+    }
+
+    const ratio = finiteNumber(values.compressionRatio, 1, 1, 20);
+    if (ratio > 1.001) {
+      const threshold = finiteNumber(values.compressionThreshold, -20, -60, 0);
+      const attack = finiteNumber(values.attack, 10, 0.01, 2000);
+      const release = finiteNumber(values.release, 120, 1, 9000);
+      const makeupDb = finiteNumber(values.makeupGain, 0, 0, 36);
+      const makeup = Math.min(64, Math.max(1, 10 ** (makeupDb / 20)));
+      filters.push(
+        `acompressor=threshold=${threshold.toFixed(2)}dB:ratio=${ratio.toFixed(2)}` +
+        `:attack=${attack.toFixed(2)}:release=${release.toFixed(2)}:makeup=${makeup.toFixed(4)}`,
+      );
+    }
+
+    if (values.limiterEnabled === true) {
+      const limiterDb = finiteNumber(values.limiterCeiling, -1, -12, -0.1);
+      const limiterLinear = 10 ** (limiterDb / 20);
+      filters.push(`alimiter=limit=${limiterLinear.toFixed(6)}:level=false`);
+    }
   }
 
-  if (!verificationPassed && outputIsHardSilent(finalAnalysis)) {
-    // Last resort: force a straight gain boost off the actually-measured level
-    // of the retry output, rather than dropping the file. This is what fixes
-    // "some files come out too quiet to hear" — instead of failing the file
-    // (which just silently excludes it from the zip), we push its peak up to
-    // just under the limiter ceiling so it's audible, even if that means it
-    // no longer sits exactly at the target integrated LUFS.
-    const measuredPeak = finiteMeasurementValue(finalAnalysis?.maxPeak);
-    const headroom = 1.0; // dB below the limiter ceiling / 0dBFS
-    const forcedGainDb = measuredPeak != null
-      ? Math.min(24, Math.max(0, (limiterCeiling - headroom) - measuredPeak))
-      : 18; // no usable measurement at all — apply a large flat boost
+  if (!values.speedBeforeEnhance) filters.push(...speedFilters);
 
-    log.warn?.(
-      { id: file.id, forcedGainDb, measuredPeak },
-      "still inaudible after retry — applying forced gain repair pass",
-    );
+  const fadeIn = finiteNumber(values.fadeIn, 0, 0, 30);
+  if (fadeIn > 0) filters.push(`afade=t=in:st=0:d=${fadeIn.toFixed(3)}`);
 
-    const repairFilters = [
-      `volume=${forcedGainDb.toFixed(2)}dB`,
-      `alimiter=limit=${limiterCeiling}dB`,
-    ];
-    await runFfmpeg([
-      "-hide_banner", "-y",
-      "-i", stagedWav,
-      "-af", repairFilters.join(","),
-      "-ar", sr,
-      "-ac", channels,
-      "-c:a", "libmp3lame",
-      "-b:a", bitrate,
-      outAbs,
-    ]);
-    finalAnalysis = await analyzeMp3(outAbs).catch(() => null);
-    verificationPassed = !outputIsHardSilent(finalAnalysis);
-  }
+  return filters;
+}
 
-  if (!verificationPassed) {
-    // Only reaches here if the source itself is genuinely silent/corrupted
-    // (forced gain couldn't recover it either) — safer to fail than to ship
-    // amplified noise/silence.
-    throw new Error(
-      `output audio failed loudness safety check (LUFS=${finalAnalysis?.lufs ?? "unmeasurable"}, ` +
-      `peak=${finalAnalysis?.maxPeak ?? "unmeasurable"} dB, RMS=${finalAnalysis?.rms ?? "unmeasurable"} dB)`,
-    );
-  }
+export function resolveExportSettings(settings) {
+  let bitrateValue = Number(settings.outputBitrate);
+  if (!Number.isFinite(bitrateValue) || settings.outputBitrate === "preserve") bitrateValue = 192_000;
+  if (bitrateValue <= 320) bitrateValue *= 1000;
+  const bitrateKbps = Math.round(finiteNumber(bitrateValue / 1000, 192, 64, 320));
 
-  await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
+  let sampleRate = Number(settings.outputSampleRate);
+  if (![32_000, 44_100, 48_000].includes(sampleRate)) sampleRate = 48_000;
 
-  const outStat = await fs.stat(outAbs).catch(() => null);
+  let channels = 2;
+  if (settings.outputChannels === "mono" || Number(settings.outputChannels) === 1) channels = 1;
+  if (settings.outputChannels === "stereo" || Number(settings.outputChannels) === 2) channels = 2;
+
+  return Object.freeze({
+    codec: "libmp3lame",
+    bitrateKbps,
+    sampleRate,
+    channels,
+  });
+}
+
+function validLoudnormMeasurement(measured) {
+  const fields = ["input_i", "input_lra", "input_tp", "input_thresh", "target_offset"];
+  return Boolean(measured) && fields.every((field) => Number.isFinite(Number(measured[field])));
+}
+
+export function verificationResult(analysis) {
+  const integrated = Number(analysis?.lufs);
+  const truePeak = Number(analysis?.truePeak);
+  const loudnessDeviation = Number.isFinite(integrated)
+    ? Math.abs(integrated - REQUIRED_TARGET_LUFS)
+    : Infinity;
+  const loudnessPassed = Number.isFinite(integrated) && loudnessDeviation <= REQUIRED_TOLERANCE_LU + 1e-9;
+  const truePeakPassed = Number.isFinite(truePeak) && truePeak <= REQUIRED_TRUE_PEAK_DBTP + 1e-9;
   return {
-    outRel,
-    originalAnalysis,
-    finalAnalysis,
-    result: {
-      finalLufs: finalAnalysis?.lufs,
-      finalTruePeak: finalAnalysis?.truePeak,
-      finalDuration: finalAnalysis?.duration,
-      outputSize: outStat?.size,
-      verificationPassed,
-    },
+    passed: loudnessPassed && truePeakPassed,
+    loudnessPassed,
+    truePeakPassed,
+    loudnessDeviation,
+    integrated,
+    truePeak,
   };
 }
 
-function csvEscape(v) {
-  if (v == null) return "";
-  const s = String(v);
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
+function buildSecondPassFilter(measured, { targetLufs, targetLra, truePeak, linear }) {
+  if (!validLoudnormMeasurement(measured)) {
+    throw new Error("first-pass loudnorm measurement was incomplete or non-finite");
+  }
+  return `loudnorm=I=${targetLufs}:LRA=${targetLra}:TP=${truePeak}` +
+    `:measured_I=${Number(measured.input_i)}` +
+    `:measured_LRA=${Number(measured.input_lra)}` +
+    `:measured_TP=${Number(measured.input_tp)}` +
+    `:measured_thresh=${Number(measured.input_thresh)}` +
+    `:offset=${Number(measured.target_offset)}` +
+    `:linear=${linear ? "true" : "false"}:print_format=json`;
+}
+
+async function prepareMeasurableStage({ stagedPath, stageDirectory, targetLra, signal }) {
+  const preliminary = await measureLoudness(stagedPath, {
+    targetLufs: REQUIRED_TARGET_LUFS,
+    targetLra,
+    truePeak: REQUIRED_TRUE_PEAK_DBTP,
+    signal,
+  });
+  if (validLoudnormMeasurement(preliminary)) {
+    return { normalizationInput: stagedPath, preconditioningGainDb: 0 };
+  }
+
+  const volume = await measureVolume(stagedPath, { signal });
+  if (!Number.isFinite(volume.maxVolumeDb)) {
+    throw new Error("audio is digitally silent or has no measurable samples");
+  }
+
+  // Raise the peak only enough to cross R128's absolute gate with safe headroom.
+  // This is a preconditioner before Pass 1, never a replacement for loudnorm.
+  const gainDb = finiteNumber(-12 - volume.maxVolumeDb, 0, 0, 60);
+  if (gainDb <= 0) {
+    throw new Error("audio is unmeasurable by EBU R128 despite having non-silent samples");
+  }
+  const conditionedPath = path.join(stageDirectory, "preconditioned.wav");
+  await runFfmpeg([
+    "-hide_banner",
+    "-nostats",
+    "-y",
+    "-i", stagedPath,
+    "-map", "0:a:0",
+    "-af", `volume=${gainDb.toFixed(3)}dB`,
+    "-c:a", "pcm_f32le",
+    conditionedPath,
+  ], { signal });
+
+  const conditionedMeasurement = await measureLoudness(conditionedPath, {
+    targetLufs: REQUIRED_TARGET_LUFS,
+    targetLra,
+    truePeak: REQUIRED_TRUE_PEAK_DBTP,
+    signal,
+  });
+  if (!validLoudnormMeasurement(conditionedMeasurement)) {
+    throw new Error("quiet-audio preconditioning could not produce a valid R128 measurement");
+  }
+  return { normalizationInput: conditionedPath, preconditioningGainDb: gainDb };
+}
+
+async function renderAttempt({
+  stagedPath,
+  sourcePath,
+  outputPath,
+  exportSettings,
+  targetLra,
+  targetLufs,
+  normalizationTruePeak,
+  linear,
+  signal,
+}) {
+  // Pass 1: measure the exact post-preset/post-compressor audio that will be normalized.
+  const measured = await measureLoudness(stagedPath, {
+    targetLufs,
+    targetLra,
+    truePeak: normalizationTruePeak,
+    signal,
+  });
+  if (!validLoudnormMeasurement(measured)) {
+    throw new Error(
+      `first-pass loudnorm could not measure this file (I=${measured?.input_i ?? "missing"}, ` +
+      `LRA=${measured?.input_lra ?? "missing"}, TP=${measured?.input_tp ?? "missing"}, ` +
+      `threshold=${measured?.input_thresh ?? "missing"})`,
+    );
+  }
+
+  // Pass 2: apply loudnorm using every measured first-pass value. No filters are
+  // placed after loudnorm; this protects the final integrated loudness.
+  const loudnormFilter = buildSecondPassFilter(measured, {
+    targetLufs,
+    targetLra,
+    truePeak: normalizationTruePeak,
+    linear,
+  });
+  await runFfmpeg([
+    "-hide_banner",
+    "-nostats",
+    "-y",
+    "-i", stagedPath,
+    "-i", sourcePath,
+    "-map", "0:a:0",
+    "-map_metadata", "1",
+    "-af", loudnormFilter,
+    "-ar", String(exportSettings.sampleRate),
+    "-ac", String(exportSettings.channels),
+    "-c:a", exportSettings.codec,
+    "-b:a", `${exportSettings.bitrateKbps}k`,
+    "-id3v2_version", "3",
+    "-write_xing", "1",
+    outputPath,
+  ], { signal });
+
+  const finalAnalysis = await analyzeMp3(outputPath, { signal });
+  return { measured, finalAnalysis, verification: verificationResult(finalAnalysis) };
+}
+
+export async function processFile({ job, file, log }) {
+  const signal = job.abortController.signal;
+  const sourcePath = job.fileMap.get(file.id);
+  if (!sourcePath) throw new Error("input file is missing");
+  if (signal.aborted) throw Object.assign(new Error("job cancelled"), { name: "AbortError" });
+
+  const outputRelative = safeOutputPath(file.folder, file.name);
+  const outputPath = path.join(job.outDir, ...outputRelative.split("/"));
+  const resolvedOutput = path.resolve(outputPath);
+  const outputRoot = `${path.resolve(job.outDir)}${path.sep}`;
+  if (!resolvedOutput.startsWith(outputRoot)) throw new Error("unsafe output path");
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+
+  const originalAnalysis = await analyzeMp3(sourcePath, { signal });
+  const stageDirectory = path.join(job.dir, `stage_${file.id}`);
+  const stagedPath = path.join(stageDirectory, "post_filters.wav");
+  await fs.mkdir(stageDirectory, { recursive: true });
+
+  try {
+    const preFilters = buildProcessingFilters(job.settings, file.overrides ?? {});
+    const stageArgs = [
+      "-hide_banner",
+      "-nostats",
+      "-y",
+      "-i", sourcePath,
+      "-map", "0:a:0",
+    ];
+    if (preFilters.length > 0) stageArgs.push("-af", preFilters.join(","));
+    stageArgs.push(
+      "-ar", String(job.exportSettings.sampleRate),
+      "-ac", String(job.exportSettings.channels),
+      "-c:a", "pcm_f32le",
+      stagedPath,
+    );
+    await runFfmpeg(stageArgs, { signal });
+
+    const targetLra = finiteNumber(job.settings.loudnessRange, DEFAULT_TARGET_LRA, 1, 20);
+    const { normalizationInput, preconditioningGainDb } = await prepareMeasurableStage({
+      stagedPath,
+      stageDirectory,
+      targetLra,
+      signal,
+    });
+    const attempts = [];
+    let correction = 0;
+
+    for (let attempt = 1; attempt <= MAX_NORMALIZATION_ATTEMPTS; attempt += 1) {
+      const targetLufs = REQUIRED_TARGET_LUFS + correction;
+      const normalizationTruePeak = attempt === 1 ? REQUIRED_TRUE_PEAK_DBTP : -1.8;
+      const linear = attempt === 1;
+      await fs.rm(outputPath, { force: true }).catch(() => {});
+
+      const attemptResult = await renderAttempt({
+        stagedPath: normalizationInput,
+        sourcePath,
+        outputPath,
+        exportSettings: job.exportSettings,
+        targetLra,
+        targetLufs,
+        normalizationTruePeak,
+        linear,
+        signal,
+      });
+      attempts.push({
+        attempt,
+        targetLufs,
+        normalizationTruePeak,
+        linear,
+        pass1: attemptResult.measured,
+        finalLufs: attemptResult.finalAnalysis.lufs,
+        finalTruePeak: attemptResult.finalAnalysis.truePeak,
+        verification: attemptResult.verification,
+      });
+
+      if (attemptResult.verification.passed) {
+        const outputStat = await fs.stat(outputPath);
+        return {
+          originalAnalysis,
+          finalAnalysis: attemptResult.finalAnalysis,
+          pass1Measurement: attemptResult.measured,
+          attempts,
+          result: {
+            finalLufs: attemptResult.finalAnalysis.lufs,
+            finalTruePeak: attemptResult.finalAnalysis.truePeak,
+            finalDuration: attemptResult.finalAnalysis.duration,
+            outputSize: outputStat.size,
+            codec: job.exportSettings.codec,
+            bitrate: job.exportSettings.bitrateKbps * 1000,
+            sampleRate: job.exportSettings.sampleRate,
+            channels: job.exportSettings.channels,
+            loudnessDeviation: attemptResult.verification.loudnessDeviation,
+            verificationPassed: true,
+            attempts: attempt,
+            preconditioningGainDb,
+          },
+        };
+      }
+
+      log.warn?.({
+        jobId: job.id,
+        fileId: file.id,
+        attempt,
+        finalLufs: attemptResult.finalAnalysis.lufs,
+        finalTruePeak: attemptResult.finalAnalysis.truePeak,
+        loudnessDeviation: attemptResult.verification.loudnessDeviation,
+      }, "strict output verification failed; retrying with a fresh two-pass measurement");
+
+      if (Number.isFinite(attemptResult.finalAnalysis.lufs)) {
+        correction = finiteNumber(
+          correction + (REQUIRED_TARGET_LUFS - attemptResult.finalAnalysis.lufs),
+          0,
+          -3.0,
+          3.0,
+        );
+      }
+    }
+
+    const last = attempts.at(-1);
+    await fs.rm(outputPath, { force: true }).catch(() => {});
+    throw new Error(
+      `file ${file.name} failed strict verification after ${MAX_NORMALIZATION_ATTEMPTS} true two-pass attempts: ` +
+      `integrated=${last?.finalLufs ?? "unmeasurable"} LUFS (required ${REQUIRED_TARGET_LUFS} ±${REQUIRED_TOLERANCE_LU}), ` +
+      `truePeak=${last?.finalTruePeak ?? "unmeasurable"} dBTP (required <= ${REQUIRED_TRUE_PEAK_DBTP})`,
+    );
+  } finally {
+    await fs.rm(stageDirectory, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function writeReport(job, rows) {
   const header = [
-    "sequence", "original_filename", "folder_path", "duration",
-    "original_lufs", "original_true_peak", "original_lra",
-    "original_bitrate", "original_sample_rate", "original_status",
-    "applied_speed", "applied_preset",
-    "final_lufs", "final_true_peak", "final_duration", "final_bitrate",
-    "processing_status", "error_message",
+    "sequence",
+    "original_filename",
+    "folder_path",
+    "original_duration_seconds",
+    "original_lufs",
+    "original_lra",
+    "original_true_peak_dbtp",
+    "original_bitrate_bps",
+    "original_sample_rate_hz",
+    "original_channels",
+    "pass1_measured_i",
+    "pass1_measured_lra",
+    "pass1_measured_tp",
+    "pass1_measured_threshold",
+    "pass1_target_offset",
+    "preconditioning_gain_db",
+    "final_lufs",
+    "loudness_deviation_lu",
+    "final_true_peak_dbtp",
+    "final_duration_seconds",
+    "final_bitrate_bps",
+    "final_sample_rate_hz",
+    "final_channels",
+    "normalization_attempts",
+    "processing_status",
+    "error_message",
   ];
   const lines = [header.join(",")];
-  for (const r of rows) lines.push(r.map(csvEscape).join(","));
-  await fs.writeFile(path.join(job.dir, "report.csv"), lines.join("\n"));
+  for (const row of rows) lines.push(row.map(csvEscape).join(","));
+  await fs.writeFile(path.join(job.dir, "report.csv"), `${lines.join("\n")}\n`, "utf8");
 }
 
-async function packageZip(job, failed) {
+async function packageZip(job) {
   const zipPath = path.join(job.dir, "result.zip");
-  await new Promise((resolve, reject) => {
-    const output = createWriteStream(zipPath);
-    const archive = archiver("zip", { zlib: { level: 6 } });
-    output.on("close", resolve);
-    archive.on("error", reject);
-    archive.pipe(output);
-    archive.directory(job.outDir, false);
-    if (job.settings.includeReports !== false) {
-      archive.file(path.join(job.dir, "report.csv"), { name: "audio_analysis_report.csv" });
-      archive.append(JSON.stringify(job.settings, null, 2), { name: "processing_settings.txt" });
+  await fs.rm(zipPath, { force: true }).catch(() => {});
+
+  try {
+    const { default: archiver } = await import("archiver");
+    await new Promise((resolve, reject) => {
+      const output = createWriteStream(zipPath, { flags: "wx" });
+      const archive = archiver("zip", { zlib: { level: 6 } });
+      output.on("close", resolve);
+      output.on("error", reject);
+      archive.on("warning", (error) => {
+        if (error.code !== "ENOENT") reject(error);
+      });
+      archive.on("error", reject);
+      archive.pipe(output);
+      archive.directory(job.outDir, false);
+      if (job.settings.includeReports !== false) {
+        archive.file(path.join(job.dir, "report.csv"), { name: "audio_analysis_report.csv" });
+        archive.append(JSON.stringify({
+          ...job.settings,
+          enforcedTargetLufs: REQUIRED_TARGET_LUFS,
+          enforcedToleranceLu: REQUIRED_TOLERANCE_LU,
+          enforcedTruePeakDbtp: REQUIRED_TRUE_PEAK_DBTP,
+          export: job.exportSettings,
+        }, null, 2), { name: "processing_settings.json" });
+      }
+      Promise.resolve(archive.finalize()).catch(reject);
+    });
+    return;
+  } catch (error) {
+    if (error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
+  }
+
+  // Dependency-free fallback for recovery/test environments. The production
+  // image includes both archiver and the zip utility.
+  await execFileP("zip", ["-q", "-r", zipPath, "."], { cwd: job.outDir });
+  if (job.settings.includeReports !== false) {
+    const reportAlias = path.join(job.dir, "audio_analysis_report.csv");
+    const settingsPath = path.join(job.dir, "processing_settings.json");
+    await fs.copyFile(path.join(job.dir, "report.csv"), reportAlias);
+    await fs.writeFile(settingsPath, JSON.stringify({
+      ...job.settings,
+      enforcedTargetLufs: REQUIRED_TARGET_LUFS,
+      enforcedToleranceLu: REQUIRED_TOLERANCE_LU,
+      enforcedTruePeakDbtp: REQUIRED_TRUE_PEAK_DBTP,
+      export: job.exportSettings,
+    }, null, 2));
+    try {
+      await execFileP("zip", ["-q", "-j", zipPath, reportAlias, settingsPath]);
+    } finally {
+      await Promise.all([
+        fs.rm(reportAlias, { force: true }),
+        fs.rm(settingsPath, { force: true }),
+      ]);
     }
-    if (failed.length > 0) {
-      archive.append(
-        failed.map((f) => `${f.name}\t${f.error}`).join("\n"),
-        { name: "failed_files.txt" },
-      );
-    }
-    archive.finalize();
-  });
+  }
+}
+
+function successReportRow(file, original, final, pass1, result) {
+  return [
+    file.sequence,
+    file.name,
+    file.folder ?? "",
+    original.duration?.toFixed(3) ?? "",
+    original.lufs?.toFixed(2) ?? "",
+    original.lra?.toFixed(2) ?? "",
+    original.truePeak?.toFixed(2) ?? "",
+    original.bitrate ?? "",
+    original.sampleRate ?? "",
+    original.channels ?? "",
+    pass1?.input_i ?? "",
+    pass1?.input_lra ?? "",
+    pass1?.input_tp ?? "",
+    pass1?.input_thresh ?? "",
+    pass1?.target_offset ?? "",
+    result.preconditioningGainDb?.toFixed(3) ?? "0.000",
+    final.lufs?.toFixed(2) ?? "",
+    result.loudnessDeviation?.toFixed(3) ?? "",
+    final.truePeak?.toFixed(2) ?? "",
+    final.duration?.toFixed(3) ?? "",
+    result.bitrate ?? "",
+    result.sampleRate ?? "",
+    result.channels ?? "",
+    result.attempts,
+    "passed",
+    "",
+  ];
+}
+
+function failedReportRow(file, error) {
+  return [
+    file.sequence,
+    file.name,
+    file.folder ?? "",
+    "", "", "", "", "", "", "",
+    "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "",
+    "failed",
+    error,
+  ];
 }
 
 export async function runJob(job, log) {
+  const { workerCount, limiter } = await limiterPromise;
   const included = job.files
-    .filter((f) => !f.excluded && job.fileMap.has(f.id))
-    .sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0));
+    .filter((file) => !file.excluded && job.fileMap.has(file.id))
+    .sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));
   const total = included.length;
+  job.exportSettings = resolveExportSettings(job.settings);
+  job.status = "processing";
 
-  const emitProgress = (patch) => {
-    job.progress = { ...job.progress, ...patch };
+  const reportRows = new Array(total);
+  const failures = new Array(total);
+  const active = new Map();
+  let nextIndex = 0;
+  let completed = 0;
+  let failed = 0;
+  const startedAt = Date.now();
+
+  const emitProgress = (patch = {}) => {
+    const finished = completed + failed;
+    const elapsedSeconds = Math.max(0.001, (Date.now() - startedAt) / 1000);
+    const rate = finished / elapsedSeconds;
+    const remaining = Math.max(0, total - finished);
+    job.progress = {
+      ...job.progress,
+      stage: job.status,
+      completed,
+      failed,
+      total,
+      processing: active.size,
+      currentlyProcessing: [...active.values()],
+      current: [...active.values()][0] ?? null,
+      overallPct: total === 0 ? 100 : Math.round((finished / total) * 100),
+      etaSeconds: rate > 0 ? Math.ceil(remaining / rate) : null,
+      workerCount,
+      ...patch,
+    };
     job.emit("progress", job.progress);
   };
 
-  emitProgress({ stage: "processing", overallPct: 0, completed: 0, failed: 0, total });
+  emitProgress();
 
-  const reportRows = [];
-  const failed = [];
-  let completed = 0;
-  let failCount = 0;
-
-  for (const file of included) {
-    if (job.cancelled) {
-      emitProgress({ stage: "failed", message: "cancelled" });
-      return;
-    }
-    emitProgress({
-      stage: "processing",
-      current: file.folder ? `${file.folder}/${file.name}` : file.name,
-    });
+  async function processIndex(index) {
+    const file = included[index];
+    const displayName = file.folder ? `${file.folder}/${file.name}` : file.name;
+    active.set(file.id, displayName);
+    emitProgress();
     try {
-      const { originalAnalysis, finalAnalysis, result } = await processFile({ job, file, log });
-      completed++;
-      job.fileResults.push({ id: file.id, result });
-      job.emit("file", { id: file.id, result });
-      reportRows.push([
-        file.sequence,
-        file.name,
-        file.folder ?? "",
-        originalAnalysis?.duration?.toFixed(2) ?? "",
-        originalAnalysis?.lufs?.toFixed(2) ?? "",
-        originalAnalysis?.truePeak?.toFixed(2) ?? "",
-        originalAnalysis?.lra?.toFixed(2) ?? "",
-        originalAnalysis?.bitrate ?? "",
-        originalAnalysis?.sampleRate ?? "",
-        originalAnalysis?.classification ?? "",
-        file.overrides?.speed ?? job.settings.speed ?? 1,
-        file.overrides?.preset ?? job.settings.preset ?? "original",
-        finalAnalysis?.lufs?.toFixed(2) ?? "",
-        finalAnalysis?.truePeak?.toFixed(2) ?? "",
-        finalAnalysis?.duration?.toFixed(2) ?? "",
-        finalAnalysis?.bitrate ?? "",
-        result.verificationPassed ? "ok" : "verification_miss",
-        "",
-      ]);
-    } catch (err) {
-      failCount++;
-      const msg = err.message ?? String(err);
-      log.error?.({ err, file: file.name }, "file failed");
-      failed.push({ name: file.name, error: msg });
-      job.fileResults.push({ id: file.id, result: { error: msg, verificationPassed: false } });
-      job.emit("file", { id: file.id, result: { error: msg, verificationPassed: false } });
-      reportRows.push([
-        file.sequence, file.name, file.folder ?? "",
-        "", "", "", "", "", "", "",
-        file.overrides?.speed ?? job.settings.speed ?? 1,
-        file.overrides?.preset ?? job.settings.preset ?? "original",
-        "", "", "", "", "failed", msg,
-      ]);
+      const processed = await limiter.run(
+        () => processFile({ job, file, log }),
+        { signal: job.abortController.signal },
+      );
+      completed += 1;
+      const event = { id: file.id, result: processed.result };
+      job.fileResults.push(event);
+      job.emit("file", event);
+      reportRows[index] = successReportRow(
+        file,
+        processed.originalAnalysis,
+        processed.finalAnalysis,
+        processed.pass1Measurement,
+        processed.result,
+      );
+    } catch (error) {
+      const message = error?.message ?? String(error);
+      failed += 1;
+      failures[index] = { name: displayName, error: message };
+      const event = { id: file.id, result: { error: message, verificationPassed: false } };
+      job.fileResults.push(event);
+      job.emit("file", event);
+      reportRows[index] = failedReportRow(file, message);
+      if (error?.name !== "AbortError") log.error?.({ error, jobId: job.id, file: displayName }, "file failed");
+    } finally {
+      active.delete(file.id);
+      emitProgress();
     }
-    emitProgress({
-      completed,
-      failed: failCount,
-      overallPct: Math.round(((completed + failCount) / total) * 100),
-    });
   }
 
-  emitProgress({ stage: "packaging", overallPct: 100 });
-  await writeReport(job, reportRows);
-  await packageZip(job, failed);
-  emitProgress({ stage: "ready", overallPct: 100 });
-  job.done = true;
-  job.emit("done");
+  async function workerLoop() {
+    while (!job.cancelled) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= total) return;
+      await processIndex(index);
+    }
+  }
+
+  const localWorkers = Math.min(workerCount, Math.max(1, total));
+  await Promise.all(Array.from({ length: localWorkers }, () => workerLoop()));
+
+  if (job.cancelled || job.abortController.signal.aborted) {
+    job.status = "cancelled";
+    emitProgress({ stage: "cancelled", message: "cancelled", etaSeconds: 0 });
+    await writeReport(job, reportRows.filter(Boolean));
+    finishJob(job, { status: "cancelled", success: false, error: "job cancelled" });
+    return;
+  }
+
+  job.status = "packaging";
+  emitProgress({ stage: "packaging", overallPct: 100, etaSeconds: 0 });
+  await writeReport(job, reportRows.filter(Boolean));
+
+  if (failures.some(Boolean)) {
+    await fs.rm(path.join(job.dir, "result.zip"), { force: true }).catch(() => {});
+    job.status = "failed";
+    const error = `${failed} of ${total} files failed processing or strict loudness verification`;
+    emitProgress({ stage: "failed", message: error, overallPct: 100, etaSeconds: 0 });
+    finishJob(job, { status: "failed", success: false, error });
+    return;
+  }
+
+  await packageZip(job);
+  job.status = "ready";
+  emitProgress({ stage: "ready", overallPct: 100, etaSeconds: 0 });
+  finishJob(job, { status: "ready", success: true });
 }

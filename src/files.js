@@ -1,80 +1,52 @@
-import fs from 'node:fs';
-import fsp from 'node:fs/promises';
-import path from 'node:path';
-import unzipper from 'unzipper';
-import archiver from 'archiver';
+import fs from "node:fs";
+import { promises as fsp } from "node:fs";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
 
-export async function ensureDirs(...dirs) {
-  await Promise.all(dirs.map((dir) => fsp.mkdir(dir, { recursive: true })));
+export async function ensureDirs(...directories) {
+  await Promise.all(directories.map((directory) => fsp.mkdir(directory, { recursive: true })));
 }
 
-export async function saveUpload(part, destination, maxBytes) {
+export function safeUploadId(value) {
+  const id = String(value ?? "");
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(id)) throw new Error("invalid file id");
+  return id;
+}
+
+export function safeOutputPath(folder, filename) {
+  const name = String(filename ?? "").trim();
+  if (!name || /[\/\\\0]/.test(name) || name !== path.basename(name) || !name.toLowerCase().endsWith(".mp3")) {
+    throw new Error("invalid output filename");
+  }
+  const rawFolder = String(folder ?? "");
+  if (rawFolder.includes("\0")) throw new Error("invalid output folder");
+  const normalizedFolder = rawFolder.replaceAll("\\", "/").replace(/^\/+/, "");
+  const cleanFolder = normalizedFolder ? path.posix.normalize(normalizedFolder) : "";
+  if (cleanFolder === "." || cleanFolder.startsWith("../") || path.posix.isAbsolute(cleanFolder)) {
+    throw new Error("invalid output folder");
+  }
+  const relative = cleanFolder ? path.posix.join(cleanFolder, name) : name;
+  if (relative.startsWith("../") || path.posix.isAbsolute(relative)) throw new Error("unsafe output path");
+  return relative;
+}
+
+export async function saveMultipartFile(part, destination) {
   await ensureDirs(path.dirname(destination));
-  let bytes = 0;
-  const out = fs.createWriteStream(destination, { flags: 'wx' });
+  const output = fs.createWriteStream(destination, { flags: "wx" });
   try {
-    for await (const chunk of part.file) {
-      bytes += chunk.length;
-      if (bytes > maxBytes) throw new Error(`Upload exceeds ${Math.round(maxBytes / 1024 / 1024)} MB limit`);
-      if (!out.write(chunk)) await new Promise((resolve) => out.once('drain', resolve));
-    }
-    await new Promise((resolve, reject) => out.end((err) => err ? reject(err) : resolve()));
-    return bytes;
+    await pipeline(part.file, output);
+    if (part.file.truncated) throw new Error("uploaded file exceeded the configured size limit");
+    const stat = await fsp.stat(destination);
+    if (stat.size === 0) throw new Error("uploaded file is empty");
+    return stat.size;
   } catch (error) {
-    out.destroy();
+    output.destroy();
     await fsp.rm(destination, { force: true }).catch(() => {});
     throw error;
   }
 }
 
-function safeRelative(entryPath) {
-  const normalized = entryPath.replaceAll('\\', '/').replace(/^\/+/, '');
-  const clean = path.posix.normalize(normalized);
-  if (!clean || clean === '.' || clean.startsWith('../') || path.posix.isAbsolute(clean)) return null;
-  return clean;
-}
-
-export async function extractZip(zipPath, destination) {
-  await ensureDirs(destination);
-  const directory = await unzipper.Open.file(zipPath);
-  const audioEntries = [];
-  let sequence = 0;
-
-  for (const entry of directory.files) {
-    const rel = safeRelative(entry.path);
-    if (!rel || entry.type === 'Directory') continue;
-    if (path.extname(rel).toLowerCase() !== '.mp3') continue;
-    sequence += 1;
-    const target = path.join(destination, ...rel.split('/'));
-    const root = path.resolve(destination) + path.sep;
-    if (!path.resolve(target).startsWith(root)) throw new Error(`Unsafe ZIP path: ${entry.path}`);
-    await ensureDirs(path.dirname(target));
-    await new Promise((resolve, reject) => {
-      entry.stream().pipe(fs.createWriteStream(target)).on('finish', resolve).on('error', reject);
-    });
-    audioEntries.push({ sequence, relativePath: rel, absolutePath: target, filename: path.basename(rel) });
-  }
-
-  if (!audioEntries.length) throw new Error('ZIP contains no MP3 files');
-  return audioEntries;
-}
-
-export async function zipDirectory(sourceDir, outputPath) {
-  await ensureDirs(path.dirname(outputPath));
-  await new Promise((resolve, reject) => {
-    const output = fs.createWriteStream(outputPath);
-    const archive = archiver('zip', { zlib: { level: 6 } });
-    output.on('close', resolve);
-    output.on('error', reject);
-    archive.on('warning', (err) => err.code === 'ENOENT' ? null : reject(err));
-    archive.on('error', reject);
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    archive.finalize();
-  });
-}
-
 export function csvEscape(value) {
-  const text = value == null ? '' : String(value);
+  const text = value == null ? "" : String(value);
   return /[",\n\r]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
