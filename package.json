@@ -1,12 +1,16 @@
 {
   "name": "voice-batch-studio-backend",
-  "version": "1.0.0",
-  "description": "FFmpeg-powered backend for Voice Batch Studio",
+  "version": "2.0.0",
+  "description": "Strict verified EBU R128 batch audio normalization backend",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/server.js && node --check src/pipeline.js && node --check src/ffmpeg.js && node --check src/concurrency.js && node --check src/files.js && node --check src/jobs.js",
+    "test:core": "node --test test/core-normalization.test.mjs",
+    "test:e2e": "node --test test/e2e.test.mjs",
+    "test": "npm run test:core && npm run test:e2e"
   },
   "engines": {
     "node": ">=20"
