@@ -7,7 +7,7 @@ const TARGET_LUFS = -16;
 const TRUE_PEAK_CEILING = -1.5;
 const VERIFY_TOLERANCE = 0.3;
 const DEFAULT_OUTPUT_BITRATE = 192000;
-const DEFAULT_OUTPUT_SAMPLE_RATE = 44100;
+const DEFAULT_OUTPUT_SAMPLE_RATE = 48000;
 const DEFAULT_OUTPUT_CHANNELS = 2;
 
 const PRESET_CHAINS = {
@@ -280,70 +280,125 @@ async function processFile({ job, file, log }) {
   const tp = TRUE_PEAK_CEILING;
   const lra = finiteNumber(settings.loudnessRange, 7, 1, 20);
 
-  // Pre-analysis for report
   const originalAnalysis = await analyzeMp3(inPath, ffmpegOptions(job)).catch(() => null);
+  if (originalAnalysis?.classification === "corrupted") {
+    throw new Error(originalAnalysis.error ?? "file is not decodable audio");
+  }
 
   const preFilters = buildProcessingFilters(settings, overrides, originalAnalysis?.duration);
 
-  // Intermediate WAV so loudnorm two-pass can measure post-enhancement audio.
   const stageDir = path.join(job.dir, `stage_${file.id}`);
   await fs.mkdir(stageDir, { recursive: true });
-  const stagedWav = path.join(stageDir, "staged.wav");
+  let stagedWav = path.join(stageDir, "staged.wav");
   const outRel = safeOutputRelativePath(file, settings.renameFiles === true);
   const outAbs = outputPathInside(job.outDir, outRel);
+  const altAbs = path.join(stageDir, "alt.mp3");
   const encoding = getOutputEncoding(settings);
-  let finalAnalysis = null;
+  const warnings = [];
+  let limiterApplied = false;
+  let preGainDb = 0;
 
   try {
-    const stageArgs = [
+    // Stage: enhancement + speed + a safety limiter BEFORE normalization so
+    // clipping never causes a rejection and never shifts final loudness.
+    const stageChain = [...preFilters, "alimiter=limit=0.891:level=false"];
+    limiterApplied = true;
+    await runFfmpeg([
       "-hide_banner", "-y",
       "-i", inPath,
-    ];
-    if (preFilters.length > 0) {
-      stageArgs.push("-af", preFilters.join(","));
+      "-af", stageChain.join(","),
+      "-ar", encoding.sampleRate,
+      "-ac", encoding.channels,
+      stagedWav,
+    ], ffmpegOptions(job));
+
+    // Pass 1: measure enhanced audio.
+    let measured = await measureJobLoudness(job, stagedWav, targetLufs, tp, lra);
+
+    // Extremely quiet sources can fall below the R128 gate: pre-gain, then re-measure.
+    const measuredI = Number(measured?.input_i);
+    if (!hasUsableLoudnormMeasurement(measured) || !Number.isFinite(measuredI) || measuredI < -40) {
+      preGainDb = Number.isFinite(measuredI) ? Math.min(60, Math.max(0, -24 - measuredI)) : 30;
+      const boosted = path.join(stageDir, "boosted.wav");
+      await runFfmpeg([
+        "-hide_banner", "-y",
+        "-i", stagedWav,
+        "-af", `volume=${preGainDb.toFixed(2)}dB,alimiter=limit=0.891:level=false`,
+        "-ar", encoding.sampleRate,
+        "-ac", encoding.channels,
+        boosted,
+      ], ffmpegOptions(job));
+      await fs.rm(stagedWav, { force: true }).catch(() => {});
+      stagedWav = boosted;
+      measured = await measureJobLoudness(job, stagedWav, targetLufs, tp, lra);
+      warnings.push(`pre-gain ${preGainDb.toFixed(1)} dB applied to very quiet source`);
     }
-    stageArgs.push("-ar", encoding.sampleRate, "-ac", encoding.channels, stagedWav);
-    await runFfmpeg(stageArgs, ffmpegOptions(job));
 
-    // Pass 1: measure the enhanced/speed-adjusted staged audio.
-    const measured = requireLoudnormMeasurement(
-      await measureJobLoudness(job, stagedWav, targetLufs, tp, lra),
-      "first-pass",
-    );
-
-    // Pass 2: apply measured EBU R128 normalization. No single-pass fallback.
     await fs.mkdir(path.dirname(outAbs), { recursive: true });
-    await encodeNormalized({ job, stagedWav, outAbs, measured, targetLufs, lra, tp, encoding, linear: true });
 
-    finalAnalysis = await analyzeMp3(outAbs, ffmpegOptions(job)).catch(() => null);
-    let verification = verifyAnalysis(finalAnalysis, targetLufs, tp);
+    const scoreOf = (a) => {
+      const l = Number(a?.lufs);
+      if (!Number.isFinite(l)) return Number.POSITIVE_INFINITY;
+      return Math.abs(l - targetLufs);
+    };
 
-    if (!verification.passed) {
-      log.warn?.(
-        { id: file.id, errors: verification.errors, measured: finalAnalysis?.lufs, target: targetLufs },
-        "verification failed after linear two-pass — retrying measured dynamic pass",
-      );
-      await encodeNormalized({ job, stagedWav, outAbs, measured, targetLufs, lra, tp, encoding, linear: false });
+    let finalAnalysis = null;
+
+    if (hasUsableLoudnormMeasurement(measured)) {
+      // Pass 2: true two-pass EBU R128 with measured values.
+      await encodeNormalized({ job, stagedWav, outAbs, measured, targetLufs, lra, tp, encoding, linear: true });
       finalAnalysis = await analyzeMp3(outAbs, ffmpegOptions(job)).catch(() => null);
-      verification = verifyAnalysis(finalAnalysis, targetLufs, tp);
+
+      if (!verifyAnalysis(finalAnalysis, targetLufs, tp).passed) {
+        // Try the dynamic pass and keep whichever result is closest to target.
+        await encodeNormalized({ job, stagedWav, outAbs: altAbs, measured, targetLufs, lra, tp, encoding, linear: false });
+        const altAnalysis = await analyzeMp3(altAbs, ffmpegOptions(job)).catch(() => null);
+        if (scoreOf(altAnalysis) < scoreOf(finalAnalysis)) {
+          await fs.rename(altAbs, outAbs).catch(async () => {
+            await fs.copyFile(altAbs, outAbs);
+          });
+          finalAnalysis = altAnalysis;
+        }
+      }
+    } else {
+      // Measurement unusable: still deliver a normalized best effort.
+      warnings.push("loudnorm measurement unavailable — single-pass fallback used");
+      await runFfmpeg([
+        "-hide_banner", "-y",
+        "-i", stagedWav,
+        "-af", `loudnorm=I=${targetLufs}:LRA=${lra}:TP=${tp}`,
+        "-ar", encoding.sampleRate,
+        "-ac", encoding.channels,
+        "-c:a", "libmp3lame",
+        "-b:a", encoding.bitrate,
+        outAbs,
+      ], ffmpegOptions(job));
+      finalAnalysis = await analyzeMp3(outAbs, ffmpegOptions(job)).catch(() => null);
     }
 
+    const verification = verifyAnalysis(finalAnalysis, targetLufs, tp);
     if (!verification.passed) {
-      await fs.rm(outAbs, { force: true }).catch(() => {});
-      throw new Error(`output verification failed: ${verification.errors.join("; ")}`);
+      warnings.push(...verification.errors);
+      log.warn?.({ id: file.id, errors: verification.errors }, "kept best-effort output outside tolerance");
     }
 
     const outStat = await fs.stat(outAbs).catch(() => null);
+    if (!outStat) throw new Error("output file was not produced");
+
     return {
       outRel,
       originalAnalysis,
       finalAnalysis,
+      warnings,
+      limiterApplied,
+      preGainDb,
       result: {
         finalLufs: finalAnalysis?.lufs,
         finalTruePeak: finalAnalysis?.truePeak,
         finalDuration: finalAnalysis?.duration,
-        outputSize: outStat?.size,
-        verificationPassed: true,
+        outputSize: outStat.size,
+        verificationPassed: verification.passed,
+        warnings,
       },
     };
   } catch (err) {
@@ -361,18 +416,20 @@ function csvEscape(v) {
   return s;
 }
 
-async function writeReport(job, rows) {
+async function writeReport(job, rows, jsonRows) {
   const header = [
     "sequence", "original_filename", "folder_path", "duration",
     "original_lufs", "original_true_peak", "original_lra",
     "original_bitrate", "original_sample_rate", "original_status",
     "applied_speed", "applied_preset",
     "final_lufs", "final_true_peak", "final_duration", "final_bitrate",
-    "processing_status", "error_message",
+    "limiter_applied", "pre_gain_db", "within_tolerance",
+    "processing_status", "warnings", "error_message",
   ];
   const lines = [header.join(",")];
   for (const r of rows) lines.push(r.map(csvEscape).join(","));
   await fs.writeFile(path.join(job.dir, "report.csv"), lines.join("\n"));
+  await fs.writeFile(path.join(job.dir, "report.json"), JSON.stringify(jsonRows, null, 2));
 }
 
 async function packageZip(job, failed) {
@@ -386,6 +443,7 @@ async function packageZip(job, failed) {
     archive.directory(job.outDir, false);
     if (job.settings.includeReports !== false) {
       archive.file(path.join(job.dir, "report.csv"), { name: "audio_analysis_report.csv" });
+      archive.file(path.join(job.dir, "report.json"), { name: "audio_analysis_report.json" });
       archive.append(JSON.stringify(job.settings, null, 2), { name: "processing_settings.txt" });
     }
     if (failed.length > 0) {
@@ -419,6 +477,7 @@ export async function runJob(job, log) {
   emitProgress({ stage: "processing", overallPct: 0, completed: 0, failed: 0, total });
 
   const reportRows = [];
+  const jsonRows = [];
   const failed = [];
   let completed = 0;
   let failCount = 0;
@@ -432,11 +491,15 @@ export async function runJob(job, log) {
       stage: "processing",
       current: file.folder ? `${file.folder}/${file.name}` : file.name,
     });
+    const speed = file.overrides?.speed ?? job.settings.speed ?? 1;
+    const preset = file.overrides?.preset ?? job.settings.preset ?? "original";
     try {
-      const { originalAnalysis, finalAnalysis, result } = await processFile({ job, file, log });
+      const { originalAnalysis, finalAnalysis, result, warnings, limiterApplied, preGainDb } =
+        await processFile({ job, file, log });
       completed++;
       job.fileResults.push({ id: file.id, result });
       job.emit("file", { id: file.id, result });
+      const status = result.verificationPassed ? "ok" : "best_effort";
       reportRows.push([
         file.sequence,
         file.name,
@@ -448,15 +511,34 @@ export async function runJob(job, log) {
         originalAnalysis?.bitrate ?? "",
         originalAnalysis?.sampleRate ?? "",
         originalAnalysis?.classification ?? "",
-        file.overrides?.speed ?? job.settings.speed ?? 1,
-        file.overrides?.preset ?? job.settings.preset ?? "original",
+        speed,
+        preset,
         finalAnalysis?.lufs?.toFixed(2) ?? "",
         finalAnalysis?.truePeak?.toFixed(2) ?? "",
         finalAnalysis?.duration?.toFixed(2) ?? "",
         finalAnalysis?.bitrate ?? "",
-        result.verificationPassed ? "ok" : "verification_miss",
+        limiterApplied ? "yes" : "no",
+        (preGainDb ?? 0).toFixed(2),
+        result.verificationPassed ? "yes" : "no",
+        status,
+        (warnings ?? []).join(" | "),
         "",
       ]);
+      jsonRows.push({
+        sequence: file.sequence,
+        filename: file.name,
+        folder: file.folder ?? "",
+        status,
+        originalLufs: originalAnalysis?.lufs ?? null,
+        finalLufs: finalAnalysis?.lufs ?? null,
+        originalTruePeak: originalAnalysis?.truePeak ?? null,
+        finalTruePeak: finalAnalysis?.truePeak ?? null,
+        limiterApplied: Boolean(limiterApplied),
+        preGainDb: preGainDb ?? 0,
+        withinTolerance: Boolean(result.verificationPassed),
+        warnings: warnings ?? [],
+        error: null,
+      });
     } catch (err) {
       failCount++;
       const msg = err.message ?? String(err);
@@ -467,10 +549,24 @@ export async function runJob(job, log) {
       reportRows.push([
         file.sequence, file.name, file.folder ?? "",
         "", "", "", "", "", "", "",
-        file.overrides?.speed ?? job.settings.speed ?? 1,
-        file.overrides?.preset ?? job.settings.preset ?? "original",
-        "", "", "", "", "failed", msg,
+        speed, preset,
+        "", "", "", "", "no", "0.00", "no", "failed", "", msg,
       ]);
+      jsonRows.push({
+        sequence: file.sequence,
+        filename: file.name,
+        folder: file.folder ?? "",
+        status: "failed",
+        originalLufs: null,
+        finalLufs: null,
+        originalTruePeak: null,
+        finalTruePeak: null,
+        limiterApplied: false,
+        preGainDb: 0,
+        withinTolerance: false,
+        warnings: [],
+        error: msg,
+      });
     }
     emitProgress({
       completed,
@@ -480,7 +576,7 @@ export async function runJob(job, log) {
   }
 
   emitProgress({ stage: "packaging", overallPct: 100 });
-  await writeReport(job, reportRows);
+  await writeReport(job, reportRows, jsonRows);
   await packageZip(job, failed);
   emitProgress({ stage: "ready", overallPct: 100 });
   job.done = true;
