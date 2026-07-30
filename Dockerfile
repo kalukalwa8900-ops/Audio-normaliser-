@@ -1,21 +1,23 @@
+# Use official Node image with ffmpeg pre-installed
 FROM node:20-bookworm-slim
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg zip ca-certificates tini \
-    && rm -rf /var/lib/apt/lists/*
+# Install ffmpeg + ffprobe
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --no-audit --no-fund
 
+# Install deps
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev
+
+# Copy source
 COPY src ./src
-RUN mkdir -p /app/work && chown -R node:node /app
 
+# Railway sets PORT
 ENV NODE_ENV=production
 ENV PORT=8080
-ENV WORK_ROOT=/app/work
 EXPOSE 8080
 
-USER node
-ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "src/server.js"]
